@@ -49,15 +49,6 @@ _resolve_sample_files = _require("inspect_ai._eval.task.sandbox", "resolve_sampl
 _sample_active = _require("inspect_ai.log._samples", "sample_active")
 
 
-def sandbox_type_name(env: Any) -> str | None:
-    """The registered sandbox type of a live environment (unwrapping Inspect's event proxy)."""
-    inner = getattr(env, "_sandbox", env)
-    try:
-        return cast(str, registry_unqualified_name(registry_info(type(inner)).name))
-    except Exception:
-        return None
-
-
 def unproxy(env: Any) -> Any:
     """The provider's own environment behind Inspect's `SandboxEnvironmentProxy`, if any."""
     return getattr(env, "_sandbox", env)

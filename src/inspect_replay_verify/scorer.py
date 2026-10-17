@@ -4,7 +4,6 @@ import logging
 from collections.abc import Iterable, Mapping, Sequence
 from typing import Any
 
-from inspect_ai.dataset import Sample
 from inspect_ai.log import read_eval_log_async, transcript
 from inspect_ai.scorer import (
     CORRECT,
@@ -23,60 +22,11 @@ from inspect_ai.tool import Tool
 from inspect_ai.util import SandboxEnvironmentSpec, SandboxEnvironmentType
 
 from . import _inspect_compat as compat
-from .adapters import ReplayAdapter, adapter_for
+from .adapters import ReplayAdapter
 from .metrics import inconclusive_rate, refuted_rate, verified_rate
-from .replay import (
-    ChecksArg,
-    OnDivergence,
-    PristineState,
-    ReplayContext,
-    ReplayReport,
-    default_tools,
-    fresh_tools,
-    replay,
-    resolve_checks,
-)
-from .transcript import (
-    DEFAULT_SKIP_TOOLS,
-    UNTRANSCRIBED_POLICIES,
-    Untranscribed,
-    recorded_calls,
-)
-
-
-def as_spec(sandbox: SandboxEnvironmentType | None) -> SandboxEnvironmentSpec | None:
-    """A `SandboxEnvironmentSpec` from any of Inspect's sandbox shorthands."""
-    if sandbox is None or isinstance(sandbox, SandboxEnvironmentSpec):
-        return sandbox
-    if isinstance(sandbox, str):
-        return SandboxEnvironmentSpec(sandbox)
-    return SandboxEnvironmentSpec(sandbox[0], sandbox[1])
-
-
-async def pristine_state(
-    sample: Sample, task_sandbox: SandboxEnvironmentSpec | None, task_name: str | None
-) -> PristineState | None:
-    """The sandbox spec, files and setup a sample started from, resolved as Inspect does."""
-    spec = await compat.resolve_sandbox(task_sandbox, sample, task_name)
-    if spec is None:
-        return None
-    files: dict[str, bytes] = {}
-    for path, contents in compat.resolve_sample_files(dict(sample.files or {})).items():
-        files[path] = await compat.read_sample_file(contents)
-    setup: bytes | None = None
-    if sample.setup:
-        setup = await compat.read_sample_file(sample.setup)
-        text = setup.decode("utf-8")
-        if not text.strip().startswith("#!"):
-            setup = f"#!/usr/bin/env bash\n\n{text}".encode()
-    return PristineState(
-        sandbox=spec,
-        files=files,
-        setup=setup,
-        metadata=dict(sample.metadata or {}),
-        sample_id=sample.id,
-    )
-
+from .replay import ChecksArg, OnDivergence, Recording, ReplayConfig, ReplayContext, verify
+from .report import ReplayReport
+from .transcript import DEFAULT_SKIP_TOOLS, Untranscribed
 
 logger = logging.getLogger(__name__)
 _task_sandboxes: dict[str, SandboxEnvironmentSpec | None] = {}
@@ -95,26 +45,44 @@ async def running_task_sandbox() -> SandboxEnvironmentSpec | None:
     if location not in _task_sandboxes:
         try:
             header = await read_eval_log_async(location, header_only=True)
-            _task_sandboxes[location] = header.eval.sandbox
         except Exception as ex:
             logger.warning("could not read the task sandbox from %s: %r", location, ex)
             return None
+        _task_sandboxes[location] = header.eval.sandbox
     return _task_sandboxes[location]
 
 
-def resolve_tools(
-    provided: Sequence[Tool] | None, task_tools: Sequence[Tool]
-) -> tuple[dict[str, Tool], dict[str, str]]:
-    """Fresh tool instances by name, and where each came from (provided/task/default)."""
-    tools: dict[str, Tool] = {}
-    sources: dict[str, str] = {}
-    for name, tool in default_tools().items():
-        tools[name], sources[name] = tool, "default"
-    for name, tool in fresh_tools(task_tools).items():
-        tools[name], sources[name] = tool, "task"
-    for name, tool in fresh_tools(provided or []).items():
-        tools[name], sources[name] = tool, "provided"
-    return tools, sources
+async def live_recording(state: TaskState, target: Target) -> Recording:
+    """The running sample's recording: its transcript so far and its pristine `Sample`."""
+    events = list(transcript().events)
+    count = getattr(getattr(transcript(), "history", None), "event_count", None)
+    sample = compat.active_sample()
+    missing = ""
+    if isinstance(count, int) and count > len(events):
+        missing = (
+            f"only {len(events)} of {count} transcript events are readable; a replay of "
+            "part of the transcript cannot stand for the whole"
+        )
+    elif sample is None:
+        missing = (
+            "no running sample to take the pristine state from; to verify a finished "
+            "log, use inspect_replay_verify.replay_log()"
+        )
+    return Recording(
+        events=events,
+        messages=state.messages,
+        sample=sample,
+        missing=missing,
+        task_name=compat.active_task_name() or "replay",
+        task_sandbox=await running_task_sandbox(),
+        task_tools=state.tools,
+        original_environments={
+            k: compat.unproxy(v) for k, v in compat.current_environments().items()
+        },
+        context=ReplayContext(
+            sample_id=state.sample_id, metadata=state.metadata, target=target.target
+        ),
+    )
 
 
 def score_from_report(
@@ -123,10 +91,9 @@ def score_from_report(
     inconclusive_value: Value = NOANSWER,
     extra_metadata: Mapping[str, Any] | None = None,
 ) -> Score:
-    value: Value = {
-        "verified": CORRECT,
-        "refuted": INCORRECT,
-    }.get(report.verdict, inconclusive_value)
+    value: Value = {"verified": CORRECT, "refuted": INCORRECT}.get(
+        report.verdict, inconclusive_value
+    )
     return Score(
         value=value,
         explanation=f"[{report.verdict}] {report.explanation}",
@@ -158,95 +125,24 @@ def replay_scorer(
     Args:
       checks: Ground-truth checks (see `inspect_replay_verify.checks`), or a function of
         `ReplayContext` returning them per sample.
-      sandbox: Override the task-level sandbox. By default it is read back from the
-        running eval's log header. A `Sample`'s own sandbox is layered over it exactly
-        as Inspect does.
-      tools: Tools to re-issue calls with. Defaults to the task's `state.tools`, then to
-        Inspect's standard `bash`/`python`/`text_editor`/`bash_session`. Pass the agent's
-        own tools when they are configured (timeout, user) and not on `state.tools`, as
-        with `react(tools=...)`.
-      adapter: Backend adapter; chosen by sandbox type when omitted.
-      skip_tools: Tool names never re-issued (no sandbox effect).
-      untranscribed: What a sandbox action no tool call made (a solver's own
-        `sandbox().exec`) does to the replay: ``"inconclusive"`` refuses to judge,
-        ``"replay"`` re-issues it in order, ``"ignore"`` leaves it out.
-      on_divergence: ``"record"`` notes calls whose replayed output differs from the
-        recording; ``"inconclusive"`` refuses to judge such a replay.
-      call_timeout: Wall-clock bound per re-issued call, beyond the tool's own timeout.
       inconclusive_value: Score value for an inconclusive replay (never a pass).
-      max_concurrent: Cap on simultaneous replay sandboxes across the eval.
+      sandbox, tools, adapter, skip_tools, untranscribed, on_divergence, call_timeout,
+        max_concurrent: See `ReplayConfig`. The task-level sandbox is read back from the
+        running eval's log header unless `sandbox` overrides it.
     """
-
-    if untranscribed not in UNTRANSCRIBED_POLICIES:
-        raise ValueError(f"untranscribed is one of {UNTRANSCRIBED_POLICIES}, not {untranscribed!r}")
+    config = ReplayConfig(
+        sandbox=sandbox,
+        tools=tuple(tools or ()),
+        adapter=adapter,
+        skip_tools=frozenset(skip_tools),
+        untranscribed=untranscribed,
+        on_divergence=on_divergence,
+        call_timeout=call_timeout,
+        max_concurrent=max_concurrent,
+    )
 
     async def score(state: TaskState, target: Target) -> Score:
-        events = list(transcript().events)
-        history = getattr(transcript(), "history", None)
-        count = getattr(history, "event_count", None)
-        calls, source = recorded_calls(
-            events=events,
-            messages=state.messages,
-            skip_tools=skip_tools,
-            untranscribed=untranscribed,
-        )
-        sample = compat.active_sample()
-        task_name = compat.active_task_name() or "replay"
-        spec = as_spec(sandbox)
-        chosen = adapter or adapter_for(spec.type if spec else "")
-
-        def inconclusive(why: str) -> Score:
-            report = ReplayReport(
-                verdict="inconclusive",
-                explanation=why,
-                sandbox_type=spec.type if spec else "",
-                adapter=chosen.name,
-                transcript_source=source,
-            )
-            return score_from_report(report, inconclusive_value=inconclusive_value)
-
-        if isinstance(count, int) and count > len(events):
-            return inconclusive(
-                f"only {len(events)} of {count} transcript events are readable; a replay of "
-                "part of the transcript cannot stand for the whole"
-            )
-        if sample is None:
-            return inconclusive(
-                "no running sample to take the pristine state from; to verify a finished "
-                "log, use inspect_replay_verify.replay_log()"
-            )
-        pristine = await pristine_state(sample, spec or await running_task_sandbox(), task_name)
-        if pristine is None:
-            return inconclusive(
-                "no sandbox is known for this sample (none on the sample, and the task's "
-                "could not be read from the eval log); pass replay_scorer(sandbox=...)"
-            )
-        chosen = adapter or adapter_for(pristine.sandbox.type)
-        replay_tools, tool_sources = resolve_tools(tools, state.tools)
-        originals = compat.current_environments()
-        report = await replay(
-            calls,
-            pristine,
-            checks=resolve_checks(
-                checks,
-                ReplayContext(
-                    sample_id=state.sample_id, metadata=state.metadata, target=target.target
-                ),
-            ),
-            tools=replay_tools,
-            task_name=task_name,
-            adapter=chosen,
-            on_divergence=on_divergence,
-            call_timeout=call_timeout,
-            original_identifiers=chosen.session_identifiers(
-                {k: compat.unproxy(v) for k, v in originals.items()}
-            ),
-            transcript_source=source,
-            max_concurrent=max_concurrent,
-        )
-        report.notes["tool_sources"] = {
-            c.function: tool_sources.get(c.function, "missing") for c in report.calls if c.replayed
-        }
+        report = await verify(await live_recording(state, target), checks, config)
         original = {k: v.value for k, v in (state.scores or {}).items()}
         return score_from_report(
             report,

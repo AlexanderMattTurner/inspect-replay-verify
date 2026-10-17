@@ -10,7 +10,6 @@ from typing import Any, ClassVar
 
 import pytest
 from helpers import BASH_ARG, sha256
-from inspect_ai.tool import bash
 from inspect_ai.util import SandboxEnvironmentSpec, sandboxenv
 from inspect_ai.util._sandbox.local import LocalSandboxEnvironment
 
@@ -18,6 +17,9 @@ from inspect_replay_verify import (
     GloveboxAdapter,
     PristineState,
     RecordedCall,
+    ReplayAdapter,
+    ReplayConfig,
+    ReplayReport,
     adapter_for,
     command_succeeds,
     file_hash,
@@ -110,10 +112,14 @@ def call(id: str, command: str, result: str = "") -> RecordedCall:
 PRISTINE = PristineState(sandbox=SandboxEnvironmentSpec("fakebox"))
 
 
-async def go(calls: list[RecordedCall], checks: list[Any], **kwargs: Any) -> Any:
-    adapter = kwargs.pop("adapter", None) or RecordingAdapter({})
+async def go(
+    calls: list[RecordedCall],
+    checks: list[Any],
+    adapter: ReplayAdapter | None = None,
+    pristine: PristineState = PRISTINE,
+) -> ReplayReport:
     return await replay(
-        calls, PRISTINE, checks=checks, tools={"bash": bash()}, adapter=adapter, **kwargs
+        calls, pristine, checks, ReplayConfig(adapter=adapter or RecordingAdapter({}))
     )
 
 
@@ -154,12 +160,11 @@ async def test_compose_container_evidence_is_inconclusive() -> None:
 
 
 async def test_environment_without_a_run_is_inconclusive() -> None:
-    report = await replay(
+    report = await go(
         [call("c1", "true")],
-        PristineState(sandbox=SandboxEnvironmentSpec("local")),
-        checks=[file_hash("x", sha256(""))],
-        tools={"bash": bash()},
+        [file_hash("x", sha256(""))],
         adapter=GloveboxAdapter(),
+        pristine=PristineState(sandbox=SandboxEnvironmentSpec("local")),
     )
     assert report.verdict == "inconclusive"
     assert "no glovebox run" in report.explanation
@@ -225,15 +230,11 @@ async def test_sibling_without_a_run_does_not_spoil_the_vm_evidence() -> None:
     compose = PristineState(sandbox=SandboxEnvironmentSpec("fakebox-compose"))
     calls = [call("c1", "printf hello > out.txt")]
     good = [file_hash("out.txt", sha256("hello"))]
-    report = await replay(
-        calls, compose, checks=good, tools={"bash": bash()}, adapter=RecordingAdapter({})
-    )
+    report = await go(calls, good, pristine=compose)
     assert report.verdict == "verified", report.explanation
 
     on_sibling = [*good, file_hash("out.txt", sha256("hello"), sandbox="sibling")]
-    report = await replay(
-        calls, compose, checks=on_sibling, tools={"bash": bash()}, adapter=RecordingAdapter({})
-    )
+    report = await go(calls, on_sibling, pristine=compose)
     assert report.verdict == "inconclusive"
     assert "no glovebox run" in report.explanation
 

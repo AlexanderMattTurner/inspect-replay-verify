@@ -7,7 +7,7 @@ from its `SandboxEvent`s, and `untranscribed` decides what becomes of them.
 """
 
 from collections.abc import Iterable, Sequence
-from dataclasses import dataclass, field
+from dataclasses import dataclass
 from datetime import datetime
 from typing import Any, Literal, get_args
 
@@ -36,6 +36,12 @@ DEFAULT_SKIP_TOOLS: frozenset[str] = frozenset(
     }
 )
 UNTRANSCRIBED_POLICIES: tuple[str, ...] = get_args(Untranscribed)
+
+
+def validate_untranscribed(policy: str) -> None:
+    if policy not in UNTRANSCRIBED_POLICIES:
+        raise ValueError(f"untranscribed is one of {UNTRANSCRIBED_POLICIES}, not {policy!r}")
+
 
 # The span this package's replays run under, so no later read mistakes one for the agent.
 REPLAY_SPAN_TYPE = "replay_verify"
@@ -83,7 +89,6 @@ class RecordedCall:
     """An `exec`'s recorded exit status."""
     nondeterministic: bool = False
     """The original timed out, so its partial effect may not repeat exactly."""
-    extra: dict[str, Any] = field(default_factory=dict)
 
 
 def result_text(result: object) -> str:
@@ -234,8 +239,7 @@ def calls_from_events(
     untranscribed: Untranscribed = "inconclusive",
 ) -> list[RecordedCall]:
     """Recorded actions, in transcript order, from a sample's events."""
-    if untranscribed not in UNTRANSCRIBED_POLICIES:
-        raise ValueError(f"untranscribed is one of {UNTRANSCRIBED_POLICIES}, not {untranscribed!r}")
+    validate_untranscribed(untranscribed)
     events = list(events)
     spans = _Spans(events)
     skip = frozenset(skip_tools)

@@ -1,13 +1,13 @@
 """Each ground-truth check in both directions, against a real `local` sandbox."""
 
-from collections.abc import Mapping, Sequence
+from collections.abc import Mapping
+from typing import Any
 
 import pytest
 from helpers import sha256
 from inspect_ai.util import SandboxEnvironment, SandboxEnvironmentSpec
 
 import inspect_replay_verify as irv
-from inspect_replay_verify.adapters import Collected
 
 PRISTINE = irv.PristineState(
     sandbox=SandboxEnvironmentSpec("local"),
@@ -15,9 +15,10 @@ PRISTINE = irv.PristineState(
 )
 
 
-async def verdict(check: irv.Check, adapter: irv.ReplayAdapter | None = None) -> str:
-    report = await irv.replay([], PRISTINE, checks=[check], tools={}, adapter=adapter)
-    return report.verdict
+async def judged(
+    checks: list[irv.Check], adapter: irv.ReplayAdapter | None = None
+) -> irv.ReplayReport:
+    return await irv.replay([], PRISTINE, checks, irv.ReplayConfig(adapter=adapter))
 
 
 @pytest.mark.parametrize(
@@ -43,22 +44,49 @@ async def verdict(check: irv.Check, adapter: irv.ReplayAdapter | None = None) ->
     ids=lambda v: getattr(v, "name", v),
 )
 async def test_check_directions(check: irv.Check, expected: str) -> None:
-    assert await verdict(check) == expected
+    assert (await judged([check])).verdict == expected
 
 
 async def test_restore_files_overwrites_before_running() -> None:
     check = irv.exit_code("bash run.sh", 0, restore_files={"run.sh": "exit 0\n"})
-    assert await verdict(check) == "verified"
+    assert (await judged([check])).verdict == "verified"
 
 
-class SilentAdapter(irv.ReplayAdapter):
-    """Returns no outcome for the checks it was handed."""
+class Untrusting(irv.ReplayAdapter):
+    """Refuses to hand out evidence, after recording why."""
 
-    async def collect(
-        self, environments: Mapping[str, SandboxEnvironment], checks: Sequence[irv.Check]
-    ) -> Collected:
-        return Collected()
+    def __init__(self, error: Exception) -> None:
+        super().__init__()
+        self.error = error
+
+    async def freeze(
+        self, environments: Mapping[str, SandboxEnvironment], notes: dict[str, Any]
+    ) -> irv.EvidenceReader:
+        notes["froze"] = False
+        raise self.error
 
 
-async def test_an_adapter_that_reports_nothing_is_inconclusive() -> None:
-    assert await verdict(irv.command_succeeds("true"), adapter=SilentAdapter()) == "inconclusive"
+@pytest.mark.parametrize(
+    ("error", "explanation"),
+    [
+        (irv.Inconclusive("the guest kept writing"), "the guest kept writing"),
+        (
+            RuntimeError("driver gone"),
+            "could not freeze the replay sandbox: RuntimeError: driver gone",
+        ),
+    ],
+)
+async def test_evidence_an_adapter_will_not_freeze_is_never_read(
+    error: Exception, explanation: str
+) -> None:
+    reads: list[str] = []
+
+    async def spy(reader: irv.EvidenceReader) -> bool:
+        reads.append("read")
+        return True
+
+    report = await judged(
+        [irv.command_succeeds("true"), irv.custom_check(spy, phase="evidence")], Untrusting(error)
+    )
+    assert (report.verdict, reads, report.notes["froze"]) == ("inconclusive", [], False)
+    assert explanation in report.explanation

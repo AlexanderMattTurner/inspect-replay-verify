@@ -1,19 +1,20 @@
-"""The per-backend seam: how a replay prepares, compares and collects evidence.
+"""The per-backend seam: how a replay compares outputs and how it reads evidence.
 
 The default adapter is right for any sandbox whose instances are independent and whose
-files can be read while it runs (Docker, local, Kubernetes). A backend that needs more —
-freezing the guest before evidence is read, masking session-scoped values — subclasses
-`ReplayAdapter` and registers under the ``inspect_replay_verify`` entry-point group.
+files can be read while it runs (Docker, local, Kubernetes). A backend that needs more
+subclasses `ReplayAdapter` and registers under the ``inspect_replay_verify`` entry-point
+group. Its main lever is `freeze`: what it takes to hand out a reader whose evidence
+nothing the replay left running can still change.
 """
 
 import re
-from collections.abc import Mapping, Sequence
-from dataclasses import dataclass, field, replace
+from collections.abc import Callable, Mapping, Sequence
+from dataclasses import replace
 from typing import Any, ClassVar
 
 from inspect_ai.util import SandboxEnvironment
 
-from ..checks import Check, CheckOutcome
+from ..checks import EvidenceReader, Sandboxes
 from ..transcript import RecordedCall
 
 # Session-scoped credential formats, so a token minted for the original run and another
@@ -33,61 +34,44 @@ DEFAULT_CREDENTIAL_PATTERNS: Mapping[str, str] = {
     "aws_access_key": r"(?<![A-Z0-9])(?:AKIA|ASIA)[0-9A-Z]{16}(?![A-Z0-9])",
 }
 
-
-@dataclass(kw_only=True, slots=True)
-class Collected:
-    """The checks' outcomes, or why the adapter could not collect them trustworthily."""
-
-    outcomes: list[CheckOutcome] = field(default_factory=list)
-    inconclusive: str | None = None
-    """Set when the evidence cannot be trusted as a whole (e.g. the guest never froze)."""
-    notes: dict[str, Any] = field(default_factory=dict)
+Remint = Callable[[str, str], str | None]
+"""(credential kind, recorded value) -> a value valid for the replay session, or None."""
 
 
-class _Live:
-    def __init__(self, environments: Mapping[str, SandboxEnvironment]) -> None:
-        self._environments = environments
-
-    def environment(self, name: str | None = None) -> SandboxEnvironment:
-        if name is None or name == "default":
-            return next(iter(self._environments.values()))
-        return self._environments[name]
-
-
-class DefaultEvidenceReader:
-    """Reads evidence through the sandbox's own `read_file`."""
+class SandboxReader:
+    """Reads evidence through each sandbox's own `read_file`."""
 
     def __init__(self, environments: Mapping[str, SandboxEnvironment]) -> None:
-        self._live = _Live(environments)
+        self._sandboxes = Sandboxes(environments)
 
     async def read_file(self, path: str, *, sandbox: str | None = None) -> bytes:
-        return await self._live.environment(sandbox).read_file(path, text=False)
-
-
-async def run_check(check: Check, target: Any) -> CheckOutcome:
-    """One check's outcome; a raise is an inconclusive outcome, never a pass."""
-    try:
-        return await check.run(target)
-    except Exception as ex:
-        return CheckOutcome(
-            name=check.name, passed=None, explanation=f"check raised {type(ex).__name__}: {ex}"
-        )
+        return await self._sandboxes.environment(sandbox).read_file(path, text=False)
 
 
 class ReplayAdapter:
-    """Default replay behaviour, correct as-is for Docker, local and similar sandboxes."""
+    """Default replay behaviour, correct as-is for Docker, local and similar sandboxes.
+
+    Args:
+      credential_patterns: Session-scoped credential formats, by kind.
+      remint: Substitutes a value valid for the replay session into a call whose
+        arguments carry a recorded credential literally.
+    """
 
     name: ClassVar[str] = "default"
     sandbox_types: ClassVar[tuple[str, ...]] = ()
     """Sandbox type names this adapter is chosen for when none is given explicitly."""
 
-    def __init__(self, *, credential_patterns: Mapping[str, str] | None = None) -> None:
+    def __init__(
+        self,
+        *,
+        credential_patterns: Mapping[str, str] | None = None,
+        remint: Remint | None = None,
+    ) -> None:
         patterns = (
             DEFAULT_CREDENTIAL_PATTERNS if credential_patterns is None else credential_patterns
         )
         self._credentials = [(kind, re.compile(p)) for kind, p in patterns.items()]
-
-    # --- comparing the replay with the recording ------------------------------------
+        self._remint = remint
 
     def session_identifiers(self, environments: Mapping[str, SandboxEnvironment]) -> list[str]:
         """Values unique to one sandbox session (a VM name, a hostname) to mask when comparing."""
@@ -107,28 +91,36 @@ class ReplayAdapter:
         return [kind for kind, pattern in self._credentials if pattern.search(blob)]
 
     def rewrite_call(self, call: RecordedCall) -> RecordedCall:
-        """The call as it should be re-issued. Identity by default."""
-        return call
+        """The call as re-issued: with `remint`, each recorded credential freshly minted."""
+        if self._remint is None or not self.credentials_in(call):
+            return call
+        remint = self._remint
 
-    # --- lifecycle ------------------------------------------------------------------
+        def fresh(kind: str) -> Callable[[re.Match[str]], str]:
+            return lambda m: remint(kind, m.group(0)) or m.group(0)
+
+        def substitute(value: Any) -> Any:
+            if isinstance(value, str):
+                for kind, pattern in self._credentials:
+                    value = pattern.sub(fresh(kind), value)
+                return value
+            if isinstance(value, list):
+                return [substitute(v) for v in value]
+            if isinstance(value, dict):
+                return {k: substitute(v) for k, v in value.items()}
+            return value
+
+        return replace(call, arguments=substitute(call.arguments))
 
     async def prepare(self, environments: Mapping[str, SandboxEnvironment]) -> None:
-        """Called after the replay sandbox reaches its pristine state, before any call."""
+        """Called once the replay sandbox reaches its pristine state, before any call."""
 
-    async def collect(
-        self, environments: Mapping[str, SandboxEnvironment], checks: Sequence[Check]
-    ) -> Collected:
-        """Run the live checks, then the evidence checks, against the replay sandbox."""
-        collected = Collected()
-        live = _Live(environments)
-        for check in (c for c in checks if c.phase == "live"):
-            collected.outcomes.append(await run_check(check, live))
-        reader = DefaultEvidenceReader(environments)
-        for check in (c for c in checks if c.phase == "evidence"):
-            collected.outcomes.append(await run_check(check, reader))
-        return collected
+    async def freeze(
+        self, environments: Mapping[str, SandboxEnvironment], notes: dict[str, Any]
+    ) -> EvidenceReader:
+        """A reader for the evidence, called after the live checks and before the evidence ones.
 
-
-def with_arguments(call: RecordedCall, arguments: dict[str, Any]) -> RecordedCall:
-    """A copy of `call` re-issued with different arguments."""
-    return replace(call, arguments=arguments)
+        Raise `Inconclusive` when the evidence cannot be trusted; anything recorded in
+        `notes` reaches the score's metadata either way.
+        """
+        return SandboxReader(environments)

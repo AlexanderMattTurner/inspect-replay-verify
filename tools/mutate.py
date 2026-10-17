@@ -91,44 +91,38 @@ MUTANTS = [
     ),
     Mutant(
         file="replay.py",
-        old='        if recorded.disposition == "skip":\n            continue',
-        new='        if recorded.disposition == "skip":\n            pass',
+        old='    if recorded.disposition == "skip":\n        return',
+        new='    if recorded.disposition == "skip":\n        pass',
         breaks="skipped calls are re-issued",
     ),
     Mutant(
         file="replay.py",
-        old="        if replayed.status != _recorded_status(recorded):",
-        new="        if False:",
+        old="    if outcome.status != _recorded_status(recorded):",
+        new="    if False:",
         breaks="an outcome only the replay had is not treated as non-reproduction",
     ),
     Mutant(
         file="replay.py",
-        old='    if diverged and on_divergence == "inconclusive":',
-        new="    if False:",
+        old='        if report.divergences and config.on_divergence == "inconclusive":',
+        new="        if False:",
         breaks="on_divergence='inconclusive' is ignored",
     ),
     Mutant(
-        file="replay.py",
-        old='    if failed:\n        return "refuted"',
-        new='    if False:\n        return "refuted"',
+        file="report.py",
+        old='        if failed:\n            self.verdict = "refuted"',
+        new='        if False:\n            self.verdict = "refuted"',
         breaks="a failed check does not refute",
     ),
     Mutant(
-        file="replay.py",
-        old='    if unknown:\n        return "inconclusive"',
-        new='    if False:\n        return "inconclusive"',
+        file="report.py",
+        old="        elif unknown:",
+        new="        elif False:",
         breaks="an unevaluable check counts as a pass",
     ),
     Mutant(
-        file="replay.py",
-        old='        return "inconclusive", "no ground-truth check produced an outcome"',
-        new='        return "verified", "no ground-truth check produced an outcome"',
-        breaks="no outcomes at all is a pass",
-    ),
-    Mutant(
         file="checks.py",
-        old="passed=digest == self.expected,",
-        new="passed=True,",
+        old="            digest == expected,",
+        new="            True,",
         breaks="file_hash passes whatever the bytes",
     ),
     Mutant(
@@ -139,8 +133,8 @@ MUTANTS = [
     ),
     Mutant(
         file="checks.py",
-        old="passed = result.returncode == self.expected_exit",
-        new="passed = True",
+        old="passed=result.returncode == expected,",
+        new="passed=True,",
         breaks="exit_code passes whatever the exit status",
     ),
     Mutant(
@@ -151,24 +145,32 @@ MUTANTS = [
     ),
     Mutant(
         file="adapters/glovebox.py",
-        old='            if not getattr(result, "established", False):',
+        old="            if not established:",
         new="            if False:",
         breaks="evidence is read from a guest that never went quiescent",
     ),
     Mutant(
-        file="adapters/glovebox.py",
-        old=(
-            '        for check in (c for c in checks if c.phase == "live"):\n'
-            "            collected.outcomes.append(await run_check(check, live))\n"
-            "\n        evidence"
-        ),
-        new="        evidence",
-        breaks="glovebox live checks never run",
+        file="replay.py",
+        old='        outcomes = [await c.run(sandboxes) for c in checks if c.phase == "live"]',
+        new="        outcomes = []",
+        breaks="live checks never run",
+    ),
+    Mutant(
+        file="replay.py",
+        old="            reader = await adapter.freeze(environments, report.notes)",
+        new="            reader = await ReplayAdapter.freeze(adapter, environments, report.notes)",
+        breaks="the adapter's freeze is bypassed, so evidence is read from a live guest",
+    ),
+    Mutant(
+        file="report.py",
+        old='        raise Inconclusive(f"{what}: {type(ex).__name__}: {ex}") from ex',
+        new="        raise",
+        breaks="a failing stage escapes as an error instead of an inconclusive verdict",
     ),
     Mutant(
         file="scorer.py",
-        old='"refuted": INCORRECT,',
-        new='"refuted": CORRECT,',
+        old='{"verified": CORRECT, "refuted": INCORRECT}',
+        new='{"verified": CORRECT, "refuted": CORRECT}',
         breaks="a refuted replay scores as a pass",
     ),
 ]

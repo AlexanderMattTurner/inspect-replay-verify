@@ -3,12 +3,7 @@
 import logging
 from importlib.metadata import entry_points
 
-from .base import (
-    DEFAULT_CREDENTIAL_PATTERNS,
-    Collected,
-    DefaultEvidenceReader,
-    ReplayAdapter,
-)
+from .base import DEFAULT_CREDENTIAL_PATTERNS, Remint, ReplayAdapter, SandboxReader
 from .glovebox import GloveboxAdapter
 
 ENTRY_POINT_GROUP = "inspect_replay_verify"
@@ -17,10 +12,10 @@ logger = logging.getLogger(__name__)
 __all__ = [
     "DEFAULT_CREDENTIAL_PATTERNS",
     "ENTRY_POINT_GROUP",
-    "Collected",
-    "DefaultEvidenceReader",
     "GloveboxAdapter",
+    "Remint",
     "ReplayAdapter",
+    "SandboxReader",
     "adapter_for",
 ]
 

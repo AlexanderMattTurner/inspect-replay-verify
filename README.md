@@ -164,8 +164,11 @@ adapter may freeze the sandbox between the two phases.
 To stop an agent from passing by rewriting its own tests, pass `restore_files=` to a live
 check. Pristine copies are then written over the agent's files before the check runs.
 
-A `custom_check` function returns a bool or a `CheckOutcome(name=..., passed=...)`.
-`CheckOutcome`, `RecordedCall` and `PristineState` take keyword arguments only.
+Every check is a `Check(name=..., phase=..., observe=...)`, and the built-ins above are
+just constructors for one. `custom_check(fn, phase=...)` wraps your own async function.
+A live check's function receives `Sandboxes` (`.environment(name)`), and an evidence
+check's receives an `EvidenceReader` (`.read_file(path)`). Either returns a bool or a
+`CheckOutcome(name=..., passed=...)`. A check that raises is inconclusive, never a pass.
 
 Checks can also be built per sample from a `ReplayContext` (sample id, metadata, target):
 
@@ -185,7 +188,18 @@ for (sample_id, epoch), report in reports.items():
 
 A log records the *names* of a sample's files, not their contents. A sample that shipped
 files therefore needs its `dataset=` entry, and without one it is reported inconclusive.
-The task's sandbox comes from the log header. Override it with `sandbox=`.
+The task's sandbox comes from the log header. Every other keyword is a `ReplayConfig`
+field, as for `replay_scorer`, such as `sandbox=` or `untranscribed=`.
+
+## Building on the pieces
+
+The scorer and `replay_log` are thin. Each turns what a run left behind into a
+`Recording` (`live_recording(state, target)` or `logged_recording(log, sample, dataset)`)
+and calls `verify(recording, checks, ReplayConfig(...))`. Pass your own `Recording` to
+verify a run from elsewhere. Below that, `replay(calls, pristine, checks, config)`
+re-issues calls you already have, and the `booted(pristine, task_name)` context manager
+gives you a fresh pristine sandbox. Any step that cannot stand for the original raises
+`Inconclusive`, and the report turns it into the verdict.
 
 ## Backends
 
@@ -193,8 +207,8 @@ Adapters are chosen by sandbox type name. Pass `adapter=` to choose one explicit
 
 ### Docker, local, Kubernetes, …
 
-These need no special handling. The default adapter runs live checks, then reads
-evidence through the sandbox's own `read_file`.
+These need no special handling. The default adapter reads evidence through the
+sandbox's own `read_file`.
 
 ### glovebox
 
@@ -229,7 +243,8 @@ byte-identical across sessions, so honest replays need nothing extra. Any real t
 surfaced in a tool output is masked before outputs are compared. A call that carries such
 a token literally in its arguments is marked `credential_scoped`, and its divergence is
 tolerated rather than counted. To substitute a fresh value into such calls, pass
-`GloveboxAdapter(remint=lambda kind, old: fresh_token(kind))`.
+`GloveboxAdapter(remint=lambda kind, old: fresh_token(kind))`. Every adapter takes
+`remint=`.
 
 Note that the replay VM's own `sample_cleanup` publishes its egress record into the
 running sample's `.eval`, alongside the original VM's record and under the replay VM's
@@ -239,12 +254,18 @@ own name.
 
 Subclass `ReplayAdapter`, set `sandbox_types`, and override any of these:
 
+- `freeze(environments, notes)`: returns the `EvidenceReader` the evidence checks use.
+  It runs after the live checks. Freeze the sandbox here if a writer the replay left
+  running could change the evidence. Raise `Inconclusive` when the evidence cannot be
+  trusted, and record what you observed in `notes`. Apart from masking its VM
+  names, the glovebox adapter is this one method and its reader.
 - `prepare(environments)`: called once the pristine state is reached, before any call.
 - `rewrite_call(call)`: changes a call before it is re-issued.
 - `session_identifiers(environments)` and `normalize(text, identifiers)`: mask values
   that differ between sessions before outputs are compared.
-- `collect(environments, checks)`: runs the checks, and may set `inconclusive` when the
-  evidence cannot be trusted.
+
+The engine owns the order: replay, then live checks, then `freeze`, then evidence
+checks. An adapter cannot skip a phase or run one out of order.
 
 Register the adapter so it is chosen without an explicit `adapter=`:
 

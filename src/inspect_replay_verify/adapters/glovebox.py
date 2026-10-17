@@ -28,20 +28,19 @@ Two things differ from a plain container:
    real token that surfaced in a tool output (and, worse, was then pasted into a later
    call): outputs are compared with credentials masked, and a call whose arguments carry
    one literally is marked credential-scoped so its divergence is tolerated rather than
-   counted. Pass `remint=` to substitute a fresh value into such calls instead.
+   counted. `remint=` (see `ReplayAdapter`) substitutes a fresh value into such calls.
 """
 
 import asyncio
-import re
-from collections.abc import Callable, Mapping, Sequence
+from collections.abc import Mapping
 from typing import Any, ClassVar
 
 from inspect_ai.util import SandboxEnvironment
 
 from .._inspect_compat import unproxy
-from ..checks import Check
-from ..transcript import RecordedCall
-from .base import Collected, ReplayAdapter, _Live, run_check, with_arguments
+from ..checks import EvidenceReader, Sandboxes
+from ..report import Inconclusive
+from .base import ReplayAdapter
 
 # Exit status the root collector uses for "no such file", distinct from a read failure.
 _MISSING = 44
@@ -49,12 +48,15 @@ _READ_SCRIPT = '[ -e "$1" ] || exit 44; [ -d "$1" ] && exit 45; exec head -c "$2
 _MAX_EVIDENCE_BYTES = 64 * 1024 * 1024
 _READ_TIMEOUT_S = 120.0
 
-Remint = Callable[[str, str], str | None]
-"""(credential kind, recorded value) -> a value valid for the replay session, or None."""
-
 
 class EvidenceUnavailable(RuntimeError):
     """The evidence cannot be read from a quiescent guest."""
+
+
+def _run_of(env: SandboxEnvironment) -> Any | None:
+    """The glovebox run behind an environment; compose siblings carry none of their own."""
+    run = getattr(unproxy(env), "_run", None)
+    return run if callable(getattr(run, "quiesce", None)) else None
 
 
 class GloveboxEvidenceReader:
@@ -62,65 +64,62 @@ class GloveboxEvidenceReader:
 
     def __init__(self, adapter: "GloveboxAdapter", environments: Mapping[str, SandboxEnvironment]):
         self._adapter = adapter
-        self._live = _Live(environments)
+        self._sandboxes = Sandboxes(environments)
 
     async def read_file(self, path: str, *, sandbox: str | None = None) -> bytes:
-        env = unproxy(self._live.environment(sandbox))
-        if getattr(env, "_container", None) is not None:
+        env = self._sandboxes.environment(sandbox)
+        if getattr(unproxy(env), "_container", None) is not None:
             raise EvidenceUnavailable(
                 "evidence inside a compose service container cannot be read once the "
                 "microVM is quiesced; check the VM's own filesystem instead"
             )
-        run = getattr(env, "_run", None)
+        run = _run_of(env)
         if run is None:
             raise EvidenceUnavailable("environment exposes no glovebox run")
         return await self._adapter.read_as_root(run, path)
 
 
 class GloveboxAdapter(ReplayAdapter):
-    """Quiesce-before-read evidence collection and session-scoped credential tolerance."""
+    """Quiesce-before-read evidence and session-scoped credential tolerance."""
 
     name: ClassVar[str] = "glovebox"
     sandbox_types: ClassVar[tuple[str, ...]] = ("glovebox",)
 
-    def __init__(
-        self,
-        *,
-        remint: Remint | None = None,
-        credential_patterns: Mapping[str, str] | None = None,
-    ) -> None:
-        super().__init__(credential_patterns=credential_patterns)
-        self._remint = remint
-
     def session_identifiers(self, environments: Mapping[str, SandboxEnvironment]) -> list[str]:
-        names: list[str] = []
-        for env in environments.values():
-            run = getattr(unproxy(env), "_run", None)
-            name = getattr(run, "name", None)
-            if isinstance(name, str):
-                names.append(name)
-        return names
+        runs = (_run_of(env) for env in environments.values())
+        return [run.name for run in runs if run is not None and isinstance(run.name, str)]
 
-    def rewrite_call(self, call: RecordedCall) -> RecordedCall:
-        if self._remint is None or not self.credentials_in(call):
-            return call
-        remint = self._remint
-
-        def fresh(kind: str) -> Callable[[re.Match[str]], str]:
-            return lambda m: remint(kind, m.group(0)) or m.group(0)
-
-        def substitute(value: Any) -> Any:
-            if isinstance(value, str):
-                for kind, pattern in self._credentials:
-                    value = pattern.sub(fresh(kind), value)
-                return value
-            if isinstance(value, list):
-                return [substitute(v) for v in value]
-            if isinstance(value, dict):
-                return {k: substitute(v) for k, v in value.items()}
-            return value
-
-        return with_arguments(call, substitute(call.arguments))
+    async def freeze(
+        self, environments: Mapping[str, SandboxEnvironment], notes: dict[str, Any]
+    ) -> EvidenceReader:
+        runs = {id(run): run for env in environments.values() if (run := _run_of(env))}
+        if not runs:
+            raise Inconclusive(
+                "the replay sandbox exposes no glovebox run to quiesce, so its evidence "
+                "cannot be read from a stopped guest"
+            )
+        reasons: list[str] = []
+        notes["quiescence"] = []
+        for run in runs.values():
+            try:
+                result = await self.quiesce(run)
+            except Exception as ex:
+                reasons.append(f"{run.name}: quiesce raised {ex!r}")
+                continue
+            established = bool(getattr(result, "established", False))
+            notes["quiescence"].append(
+                {
+                    "run": run.name,
+                    "established": established,
+                    "why": getattr(result, "why", ""),
+                    "survivors": list(getattr(result, "survivors", ())),
+                }
+            )
+            if not established:
+                reasons.append(f"{run.name}: {getattr(result, 'why', '')}")
+        if reasons:
+            raise Inconclusive("guest quiescence was not confirmed (" + "; ".join(reasons) + ")")
+        return GloveboxEvidenceReader(self, environments)
 
     # --- the glovebox-driver seams, overridable in tests ------------------------------
 
@@ -146,60 +145,3 @@ class GloveboxAdapter(ReplayAdapter):
         if len(outcome.stdout) > _MAX_EVIDENCE_BYTES:
             raise EvidenceUnavailable(f"{path} exceeds {_MAX_EVIDENCE_BYTES} bytes")
         return bytes(outcome.stdout)
-
-    # --- collection -------------------------------------------------------------------
-
-    async def collect(
-        self, environments: Mapping[str, SandboxEnvironment], checks: Sequence[Check]
-    ) -> Collected:
-        collected = Collected()
-        live = _Live(environments)
-        # (a) live checks while the guest still admits commands
-        for check in (c for c in checks if c.phase == "live"):
-            collected.outcomes.append(await run_check(check, live))
-
-        evidence = [c for c in checks if c.phase == "evidence"]
-        # (b) quiesce every distinct run, even with no evidence checks: the record of
-        # whether the replay left writers behind is itself worth having
-        # (compose siblings carry no run of their own: they live inside the same microVM)
-        runs: dict[int, Any] = {}
-        for env in environments.values():
-            run = getattr(unproxy(env), "_run", None)
-            if run is not None and callable(getattr(run, "quiesce", None)):
-                runs[id(run)] = run
-        if not runs:
-            collected.inconclusive = (
-                "the replay sandbox exposes no glovebox run to quiesce, so its "
-                "evidence cannot be read from a stopped guest"
-            )
-            return collected
-        reasons: list[str] = []
-        quiescence: list[dict[str, Any]] = []
-        for run in runs.values():
-            try:
-                result = await self.quiesce(run)
-            except Exception as ex:
-                reasons.append(f"{getattr(run, 'name', '?')}: quiesce raised {ex!r}")
-                continue
-            quiescence.append(
-                {
-                    "run": getattr(run, "name", None),
-                    "established": bool(getattr(result, "established", False)),
-                    "why": getattr(result, "why", ""),
-                    "survivors": list(getattr(result, "survivors", ())),
-                }
-            )
-            if not getattr(result, "established", False):
-                reasons.append(f"{getattr(run, 'name', '?')}: {getattr(result, 'why', '')}")
-        collected.notes["quiescence"] = quiescence
-        if reasons:
-            collected.inconclusive = (
-                "guest quiescence was not confirmed (" + "; ".join(reasons) + ")"
-            )
-            return collected
-
-        # (c) evidence through the trusted root collector
-        reader = GloveboxEvidenceReader(self, environments)
-        for check in evidence:
-            collected.outcomes.append(await run_check(check, reader))
-        return collected
