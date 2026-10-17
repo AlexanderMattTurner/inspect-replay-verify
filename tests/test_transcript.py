@@ -4,7 +4,13 @@ from datetime import UTC, datetime, timedelta
 
 import pytest
 from inspect_ai.event import ModelEvent, SandboxEvent, SpanBeginEvent, ToolEvent
-from inspect_ai.model import ChatMessageAssistant, ChatMessageTool, GenerateConfig, ModelOutput
+from inspect_ai.model import (
+    ChatMessage,
+    ChatMessageAssistant,
+    ChatMessageTool,
+    GenerateConfig,
+    ModelOutput,
+)
 from inspect_ai.tool import ToolCall, ToolCallError
 
 from inspect_replay_verify import replay_scorer
@@ -132,16 +138,10 @@ def test_sandbox_actions_the_transcript_cannot_reproduce(event: SandboxEvent) ->
 
 
 def test_a_command_a_model_call_ran_inside_is_unreproducible() -> None:
-    model = ModelEvent(
-        model="m",
-        input=[],
-        tools=[],
-        tool_choice="none",
-        config=GenerateConfig(),
-        output=ModelOutput(),
-        timestamp=T0 + timedelta(milliseconds=500),
-    )
-    events = [sandbox_event("exec", cmd="claude -p go"), model]
+    events = [
+        sandbox_event("exec", cmd="claude -p go"),
+        model_event(T0 + timedelta(milliseconds=500)),
+    ]
     [call] = calls_from_events(events, untranscribed="replay")
     assert call.disposition == "unreproducible"
     assert "model call ran during" in call.reason
@@ -174,7 +174,7 @@ def span(id: str, type: str, parent: str | None = None, name: str = "s") -> Span
     [
         ([span("t", "tool")], False),
         ([span("a", "agent"), span("t", "tool", "a")], False),
-        ([span("h", "handoff"), span("t", "tool", "h")], True),
+        ([span("h", "handoff"), span("t", "tool", "h"), span("a", "agent", "t")], True),
         ([span("t", "tool"), span("a", "agent", "t")], True),
         ([span("x", "solver", name="init")], True),
         ([span("x", "solver", name="tool")], True),
@@ -193,16 +193,51 @@ def test_which_span_owns_a_sandbox_action(spans: list[SpanBeginEvent], untranscr
     assert len(calls_from_events(events, untranscribed="replay")) == int(untranscribed)
 
 
-def test_init_sandbox_events_do_not_hide_the_message_fallback() -> None:
-    events = [span("i", "init"), sandbox_event("write_file", file="seed", input="s", span_id="i")]
-    messages = [
+def model_event(at: datetime = T0) -> ModelEvent:
+    return ModelEvent(
+        model="m",
+        input=[],
+        tools=[],
+        tool_choice="none",
+        config=GenerateConfig(),
+        output=ModelOutput(),
+        timestamp=at,
+    )
+
+
+def bash_turn(source: str | None = None) -> list[ChatMessage]:
+    return [
         ChatMessageAssistant(
-            content="", tool_calls=[ToolCall(id="a", function="bash", arguments={"cmd": "ls"})]
+            content="",
+            source=source,  # type: ignore[arg-type]
+            tool_calls=[ToolCall(id="a", function="bash", arguments={"cmd": "echo pass > out"})],
         ),
-        ChatMessageTool(content="ok", tool_call_id="a", function="bash"),
+        ChatMessageTool(content="", tool_call_id="a", function="bash"),
     ]
-    calls, source = recorded_calls(events=events, messages=messages)
+
+
+def test_messages_stand_in_only_for_a_transcript_with_no_run() -> None:
+    init_only = [span("i", "init"), sandbox_event("write_file", file="s", input="s", span_id="i")]
+    calls, source = recorded_calls(events=init_only, messages=bash_turn())
     assert ([c.id for c in calls], source) == (["a"], "messages")
+
+
+def test_a_run_with_no_tool_calls_never_replays_message_calls() -> None:
+    calls, source = recorded_calls(events=[model_event()], messages=bash_turn())
+    assert (calls, source) == ([], "events")
+
+
+def test_an_in_sandbox_agent_ignored_leaves_nothing_to_replay() -> None:
+    events = [model_event(), span("a", "agent"), sandbox_event("exec", cmd="make", span_id="a")]
+    calls, source = recorded_calls(events=events, messages=bash_turn(), untranscribed="ignore")
+    assert (calls, source) == ([], "events")
+
+
+def test_prefilled_input_calls_never_ran() -> None:
+    [call] = calls_from_messages(bash_turn(source="input"))
+    assert call.disposition == "skip"
+    [call] = calls_from_messages(bash_turn(source="generate"))
+    assert call.disposition == "replay"
 
 
 @pytest.mark.parametrize("policy", ["skip", "Replay", ""])

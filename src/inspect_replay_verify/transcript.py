@@ -147,17 +147,14 @@ class _Spans:
     def untranscribed(self, span_id: str | None) -> bool:
         """Not scoring, not sample init, and not inside a tool body the replay re-runs.
 
-        The nearest tool, agent or handoff span decides: an ordinary tool's body is
-        replayed with its call, while an agent's own sandbox calls are not.
+        The nearest tool or agent span decides: an ordinary tool's body is replayed with
+        its call, while an agent's own sandbox calls (a handoff or as-tool agent runs
+        inside an `agent` span) are not.
         """
         chain = self._ancestry(span_id)
         if not self.outside_scoring(span_id) or any(b.type == "init" for b in chain):
             return False
-        nearest = next((b.type for b in chain if b.type in ("tool", "agent", "handoff")), None)
-        if nearest != "tool":
-            return True
-        index = next(i for i, b in enumerate(chain) if b.type == "tool")
-        return index + 1 < len(chain) and chain[index + 1].type == "handoff"
+        return next((b.type for b in chain if b.type in ("tool", "agent")), None) != "tool"
 
 
 def _tool_call(event: ToolEvent, skip: frozenset[str]) -> RecordedCall:
@@ -266,6 +263,7 @@ def calls_from_messages(
     for message in messages:
         if not isinstance(message, ChatMessageAssistant):
             continue
+        prefilled = message.source == "input"
         for call in message.tool_calls or []:
             reply = replies.get(call.id)
             error = reply.error if reply is not None else None
@@ -274,6 +272,8 @@ def calls_from_messages(
             disposition, reason = _classify(
                 call.function, error, skip_tools=skip, handoff=False, incomplete=reply is None
             )
+            if prefilled:
+                disposition, reason = "skip", "prefilled in the sample's input; it never ran"
             calls.append(
                 RecordedCall(
                     id=call.id,
@@ -296,8 +296,18 @@ def recorded_calls(
     skip_tools: Iterable[str] = DEFAULT_SKIP_TOOLS,
     untranscribed: Untranscribed = "inconclusive",
 ) -> tuple[list[RecordedCall], Literal["events", "messages"]]:
-    """The actions to replay, preferring events and falling back to messages."""
-    calls = calls_from_events(events or [], skip_tools=skip_tools, untranscribed=untranscribed)
-    if calls:
-        return calls, "events"
+    """The actions to replay, from events whenever they record the agent's run.
+
+    Messages stand in only for a transcript with no tool or model event outside scoring
+    (a condensed log): there, an empty event list is missing data, not an idle agent.
+    """
+    events = list(events or [])
+    spans = _Spans(events)
+    ran = any(
+        isinstance(e, ToolEvent | ModelEvent) and spans.outside_scoring(e.span_id) for e in events
+    )
+    if ran:
+        return calls_from_events(
+            events, skip_tools=skip_tools, untranscribed=untranscribed
+        ), "events"
     return calls_from_messages(messages or [], skip_tools=skip_tools), "messages"

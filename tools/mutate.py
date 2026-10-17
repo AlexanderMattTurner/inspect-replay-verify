@@ -50,7 +50,7 @@ MUTANTS = [
     Mutant(
         file="transcript.py",
         old='        if nearest != "tool":\n            return True',
-        new='        if True:\n            return True',
+        new="        if True:\n            return True",
         breaks="a tool's own sandbox calls are counted as untranscribed",
     ),
     Mutant(
@@ -73,21 +73,21 @@ MUTANTS = [
     ),
     Mutant(
         file="transcript.py",
-        old='return index + 1 < len(chain) and chain[index + 1].type == "handoff"',
-        new="return False",
-        breaks="a handoff agent's own sandbox calls are dropped as a tool body",
-    ),
-    Mutant(
-        file="transcript.py",
         old="or len(content) >= _RECORDED_CHARS:",
         new=":",
         breaks="input Inspect cut at 10,000 characters is re-issued as if whole",
     ),
     Mutant(
         file="transcript.py",
-        old='    if calls:\n        return calls, "events"',
-        new='    if True:\n        return calls, "events"',
-        breaks="init-only events hide the message fallback",
+        old="    if ran:\n",
+        new="    if not ran:\n",
+        breaks="message calls stand in for a run the events recorded",
+    ),
+    Mutant(
+        file="transcript.py",
+        old="            if prefilled:\n",
+        new="            if False:\n",
+        breaks="tool calls prefilled in the sample's input are replayed",
     ),
     Mutant(
         file="replay.py",
