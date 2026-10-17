@@ -17,13 +17,14 @@ from .checks import (
     file_contains,
     file_exists,
     file_hash,
+    scorer_check,
     tests_pass,
 )
 from .metrics import inconclusive_rate, refuted_rate, verified_rate
-from .offline import logged_recording, replay_log, replay_log_async
+from .offline import logged_recording, logged_state, replay_log, replay_log_async
 from .replay import Recording, ReplayConfig, ReplayContext, replay, verify
 from .report import CallReplay, Inconclusive, ReplayReport, Verdict
-from .sandbox import PristineState, booted, pristine_state
+from .sandbox import PristineState, booted, pristine_state, release_task
 from .scorer import live_recording, replay_scorer
 from .transcript import DEFAULT_SKIP_TOOLS, RecordedCall, recorded_calls
 
@@ -56,13 +57,16 @@ __all__ = [
     "inconclusive_rate",
     "live_recording",
     "logged_recording",
+    "logged_state",
     "pristine_state",
     "recorded_calls",
     "refuted_rate",
+    "release_task",
     "replay",
     "replay_log",
     "replay_log_async",
     "replay_scorer",
+    "scorer_check",
     "tests_pass",
     "verified_rate",
     "verify",

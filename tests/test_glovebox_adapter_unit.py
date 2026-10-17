@@ -87,8 +87,9 @@ class RecordingAdapter(GloveboxAdapter):
 
     async def prepare(self, environments: Any) -> None:
         for env in environments.values():
-            if hasattr(env, "_run"):
-                self.vm_dirs[env._run.name] = env.directory.name
+            vm = getattr(env, "_sandbox", env)  # Inspect wraps each in its event proxy
+            if hasattr(vm, "_run"):
+                self.vm_dirs[vm._run.name] = vm.directory.name
 
 
 @pytest.fixture(autouse=True)
@@ -202,6 +203,7 @@ async def test_unknown_tool_is_inconclusive() -> None:
     assert report.verdict == "inconclusive"
     assert "custom_tool" in report.explanation
     assert [c.replayed for c in report.calls] == [True, False]
+    assert report.calls[1].reason == report.explanation
 
 
 async def test_unreproducible_call_stops_the_replay() -> None:

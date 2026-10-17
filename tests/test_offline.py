@@ -19,7 +19,9 @@ def test_an_out_of_band_effect_in_a_finished_log() -> None:
         ["cat out.txt"], file_is("out.txt", "hello"), before=[write_out_of_band("out.txt", "hello")]
     )
     verdicts = {
-        policy: next(iter(irv.replay_log(log, HELLO, untranscribed=policy).values())).verdict
+        policy: next(
+            iter(irv.replay_log(log, HELLO, config=irv.ReplayConfig(untranscribed=policy)).values())
+        ).verdict
         for policy in ("inconclusive", "ignore", "replay")
     }
     assert verdicts == {"inconclusive": "inconclusive", "ignore": "refuted", "replay": "verified"}
@@ -32,7 +34,7 @@ def test_harness_setup_in_a_finished_log() -> None:
         before=[exec_setup("printf base > repo.txt")],
     )
     checks = [irv.file_contains("repo.txt", "base agent")]
-    [report] = irv.replay_log(log, checks, untranscribed="replay").values()
+    [report] = irv.replay_log(log, checks, config=irv.ReplayConfig(untranscribed="replay")).values()
     assert report.verdict == "verified", report.explanation
 
 
@@ -57,3 +59,10 @@ def test_replay_falls_back_to_messages_without_events() -> None:
     assert (report.verdict, report.transcript_source) == ("verified", "messages"), (
         report.explanation
     )
+
+
+def test_the_tasks_own_scorer_regrades_a_finished_log() -> None:
+    log = run(["printf hello > out.txt"], file_is("out.txt", "hello"))
+    checks = [irv.scorer_check(file_is("out.txt", "hello"))]
+    [report] = irv.replay_log(log, checks).values()
+    assert report.verdict == "verified", report.explanation

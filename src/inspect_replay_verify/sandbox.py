@@ -4,7 +4,7 @@ import logging
 from collections.abc import AsyncIterator, Mapping
 from contextlib import asynccontextmanager
 from dataclasses import dataclass, field
-from typing import Any, cast
+from typing import Any
 
 import anyio
 from inspect_ai.dataset import Sample
@@ -65,18 +65,15 @@ async def pristine_state(
     )
 
 
-# The task-level inits this process ran, by (task, sandbox type, config), for release.
-_task_initialized: dict[tuple[str, str, str], SandboxEnvironmentSpec] = {}
-
-
-def _key(task_name: str, spec: SandboxEnvironmentSpec) -> tuple[str, str, str]:
-    return task_name, spec.type, repr(spec.config)
+# The task-level inits this process ran, by (sandbox type, config): the task that ran
+# each, and the spec to release it with.
+_task_initialized: dict[tuple[str, str], tuple[str, SandboxEnvironmentSpec]] = {}
 
 
 async def release_task(task_name: str) -> None:
-    """Run `task_cleanup` for every sandbox type this process booted for `task_name`."""
-    for key, spec in list(_task_initialized.items()):
-        if key[0] == task_name:
+    """Run `task_cleanup` for every sandbox type this process initialised for `task_name`."""
+    for key, (owner, spec) in list(_task_initialized.items()):
+        if owner == task_name:
             del _task_initialized[key]
             try:
                 sandbox_cls = compat.registry_find_sandboxenv(spec.type)
@@ -91,41 +88,41 @@ async def booted(
 ) -> AsyncIterator[dict[str, SandboxEnvironment]]:
     """A fresh instance of the sample's sandbox in its pristine state, bound as `sandbox()`.
 
-    The previous `sandbox()` binding is restored on exit, and the instance is cleaned up
-    however the block ends.
+    Inspect's own sample lifecycle does the work: `init_sandbox_environments_sample`
+    boots it, copies the files and runs the setup script, and wraps each environment
+    so its calls are recorded as `SandboxEvent`s; `cleanup_sandbox_environments_sample`
+    tears it down however the block ends. The previous `sandbox()` binding is restored.
     """
     spec = pristine.sandbox
     try:
         sandbox_cls = compat.registry_find_sandboxenv(spec.type)
     except Exception as ex:
         raise Inconclusive(f"sandbox type '{spec.type}' is not installed: {ex}") from ex
-    with stage("replay sandbox could not be started"):
-        if _key(task_name, spec) not in _task_initialized:
-            await sandbox_cls.task_init(task_name, spec.config)
-            _task_initialized[_key(task_name, spec)] = spec
-        metadata = {**pristine.metadata, "__sample_id__": pristine.sample_id}
-        environments = cast(
-            dict[str, SandboxEnvironment],
-            await sandbox_cls.sample_init(task_name, spec.config, metadata),
-        )
-        if not environments:
-            raise RuntimeError(f"{spec.type}.sample_init returned no environments")
-    interrupted = False
-    try:
-        with compat.bound_environments(environments):
-            with stage("replay sandbox could not reach the pristine state"):
-                await compat.copy_sandbox_environment_files(dict(pristine.files), environments)
-                if pristine.setup:
-                    await compat.setup_sandbox_environment(pristine.setup, environments)
-                for env in environments.values():
-                    await compat.resolve_root_access(env)
+    with compat.preserved_sandbox_binding():
+        with stage("replay sandbox could not be started in its pristine state"):
+            key = (spec.type, repr(spec.config))
+            if key not in _task_initialized:
+                await sandbox_cls.task_init(task_name, spec.config)
+                _task_initialized[key] = (task_name, spec)
+            environments = await compat.init_sandbox_environments_sample(
+                sandboxenv_type=sandbox_cls,
+                task_name=task_name,
+                config=spec.config,
+                files=dict(pristine.files),
+                setup=pristine.setup,
+                metadata={**pristine.metadata, "__sample_id__": pristine.sample_id},
+            )
+        interrupted = False
+        try:
             yield environments
-    except anyio.get_cancelled_exc_class():
-        interrupted = True
-        raise
-    finally:
-        with anyio.CancelScope(shield=True):
-            try:
-                await sandbox_cls.sample_cleanup(task_name, spec.config, environments, interrupted)
-            except Exception as ex:
-                logger.warning("replay sandbox cleanup failed: %r", ex)
+        except anyio.get_cancelled_exc_class():
+            interrupted = True
+            raise
+        finally:
+            with anyio.CancelScope(shield=True):
+                try:
+                    await compat.cleanup_sandbox_environments_sample(
+                        spec.type, task_name, spec.config, environments, interrupted
+                    )
+                except Exception as ex:
+                    logger.warning("replay sandbox cleanup failed: %r", ex)

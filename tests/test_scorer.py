@@ -19,7 +19,8 @@ from helpers import (
 from inspect_ai.approval import ApprovalPolicy
 from inspect_ai.dataset import Sample
 from inspect_ai.model import ModelOutput
-from inspect_ai.scorer import CORRECT, INCORRECT, NOANSWER
+from inspect_ai.scorer import CORRECT, INCORRECT, NOANSWER, Score, Target, scorer
+from inspect_ai.solver import TaskState
 
 import inspect_replay_verify as irv
 
@@ -230,3 +231,36 @@ def test_original_sandbox_is_untouched_by_the_replay() -> None:
         ["printf orig > out.txt"], [irv.replay_scorer([overwrite]), file_is("out.txt", "orig")]
     )
     assert value(log, "file_is") == CORRECT
+
+
+@pytest.mark.parametrize(
+    ("untranscribed", "verdict"), [("ignore", "refuted"), ("replay", "verified")]
+)
+def test_the_tasks_own_scorer_regrades_the_replay(untranscribed: str, verdict: str) -> None:
+    """The same scorer passes the original sandbox and judges the replay on its own terms."""
+    grader = file_is("out.txt", "hello")
+    log = run(
+        ["cat out.txt"],
+        [
+            file_is("out.txt", "hello"),
+            irv.replay_scorer([irv.scorer_check(grader)], untranscribed=untranscribed),
+        ],
+        before=[write_out_of_band("out.txt", "hello")],
+    )
+    meta = replay_meta(log)
+    assert value(log, "file_is") == CORRECT
+    assert meta["verdict"] == verdict, meta["explanation"]
+    [check] = meta["checks"]
+    assert check["name"] == "file_is"
+
+
+def test_a_scorer_that_cannot_tell_is_inconclusive() -> None:
+    @scorer(metrics=[])
+    def undecided():
+        async def score(state: TaskState, target: Target) -> Score:
+            return Score(value=NOANSWER)
+
+        return score
+
+    log = run(["true"], irv.replay_scorer([irv.scorer_check(undecided())]))
+    assert replay_meta(log)["verdict"] == "inconclusive"

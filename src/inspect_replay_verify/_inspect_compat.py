@@ -29,11 +29,11 @@ def _require(module: str, name: str) -> Any:
 
 
 registry_find_sandboxenv = _require("inspect_ai.util._sandbox.registry", "registry_find_sandboxenv")
-copy_sandbox_environment_files = _require(
-    "inspect_ai.util._sandbox.context", "copy_sandbox_environment_files"
+init_sandbox_environments_sample = _require(
+    "inspect_ai.util._sandbox.context", "init_sandbox_environments_sample"
 )
-setup_sandbox_environment = _require(
-    "inspect_ai.util._sandbox.context", "setup_sandbox_environment"
+cleanup_sandbox_environments_sample = _require(
+    "inspect_ai.util._sandbox.context", "cleanup_sandbox_environments_sample"
 )
 _environments_var = _require("inspect_ai.util._sandbox.context", "sandbox_environments_context_var")
 _with_environments_var = _require(
@@ -49,6 +49,14 @@ _resolve_sample_files = _require("inspect_ai._eval.task.sandbox", "resolve_sampl
 _sample_active = _require("inspect_ai.log._samples", "sample_active")
 
 
+def registry_name(obj: Any) -> str | None:
+    """An Inspect registry object's unqualified name (a scorer's, a tool's), if it has one."""
+    try:
+        return cast(str, registry_unqualified_name(registry_info(obj).name))
+    except Exception:
+        return None
+
+
 def unproxy(env: Any) -> Any:
     """The provider's own environment behind Inspect's `SandboxEnvironmentProxy`, if any."""
     return getattr(env, "_sandbox", env)
@@ -60,35 +68,19 @@ def current_environments() -> dict[str, Any]:
 
 
 @contextmanager
-def bound_environments(environments: dict[str, Any]) -> Iterator[None]:
-    """Make `sandbox()` resolve to `environments` for the duration of the block.
+def preserved_sandbox_binding() -> Iterator[None]:
+    """Restore what `sandbox()` resolves to after the block, whatever rebinds it inside.
 
-    The first key is the default, matching Inspect's own `sample_init` contract. The
-    previous binding is restored on exit, so the original sample's tools and any later
-    scorer see their own sandbox again.
+    `init_sandbox_environments_sample` binds the environments it creates for the rest of
+    the context; this puts the original sample's own binding back for later scorers.
     """
-    tokens = (
-        _environments_var.set(environments),
-        _with_environments_var.set({}),
-        _default_var.set(next(iter(environments))),
-    )
+    variables = (_environments_var, _with_environments_var, _default_var)
+    saved = [(var, var.get(None)) for var in variables]
     try:
         yield
     finally:
-        _default_var.reset(tokens[2])
-        _with_environments_var.reset(tokens[1])
-        _environments_var.reset(tokens[0])
-
-
-async def resolve_root_access(environment: Any) -> None:
-    """Run Inspect's post-setup root-access probe when this release has one."""
-    try:
-        module = importlib.import_module("inspect_ai.tool._sandbox_tools_utils.sandbox")
-    except ImportError:  # pragma: no cover - older releases have no probe
-        return
-    probe = getattr(module, "resolve_root_access", None)
-    if probe is not None:
-        await probe(environment)
+        for var, value in saved:
+            var.set(value)
 
 
 def active_sample() -> Any | None:

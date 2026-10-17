@@ -16,6 +16,8 @@ import anyio
 from inspect_ai.approval import ApprovalPolicy, auto_approver
 from inspect_ai.dataset import Sample
 from inspect_ai.model import ChatMessage, ChatMessageAssistant, ChatMessageTool, execute_tools
+from inspect_ai.scorer import Target
+from inspect_ai.solver import TaskState
 from inspect_ai.tool import Tool, ToolCall
 from inspect_ai.util import (
     SandboxEnvironment,
@@ -75,6 +77,9 @@ class ReplayConfig:
     max_concurrent: int | None = None
 
     def __post_init__(self) -> None:
+        # Iterables a caller passes are read once per sample, so pin them down here.
+        object.__setattr__(self, "skip_tools", frozenset(self.skip_tools))
+        object.__setattr__(self, "tools", tuple(self.tools))
         validate_untranscribed(self.untranscribed)
         if self.on_divergence not in get_args(OnDivergence):
             raise ValueError(f"on_divergence is one of {get_args(OnDivergence)}")
@@ -106,6 +111,8 @@ class Recording:
     task_sandbox: SandboxEnvironmentSpec | None = None
     task_tools: Sequence[Tool] = ()
     original_environments: Mapping[str, SandboxEnvironment] = field(default_factory=dict)
+    state: TaskState | None = None
+    """The sample's state, for checks that grade with an Inspect scorer."""
     context: ReplayContext
 
 
@@ -118,16 +125,17 @@ async def verify(recording: Recording, checks: ChecksArg, config: ReplayConfig) 
         untranscribed=config.untranscribed,
     )
     spec = as_spec(config.sandbox) or recording.task_sandbox
-    adapter = config.adapter or adapter_for(spec.type if spec else "")
-    report = ReplayReport(
-        sandbox_type=spec.type if spec else "", adapter=adapter.name, transcript_source=source
-    )
+    report = ReplayReport(sandbox_type=spec.type if spec else "", transcript_source=source)
     with report.concluding():
-        if recording.missing or recording.sample is None:
-            raise Inconclusive(recording.missing or "the pristine sample is unavailable")
+        if recording.missing:
+            raise Inconclusive(recording.missing)
+        if recording.sample is None:
+            raise Inconclusive("the pristine sample is unavailable")
         with stage("could not resolve the sample's pristine state"):
             pristine = await pristine_state(recording.sample, spec, recording.task_name)
-        resolved = list(checks(recording.context) if callable(checks) else checks)
+        with stage("the check factory raised"):
+            resolved = list(checks(recording.context) if callable(checks) else checks)
+        target = recording.context.target
         await _replay_into(
             report,
             calls,
@@ -137,6 +145,8 @@ async def verify(recording: Recording, checks: ChecksArg, config: ReplayConfig) 
             task_name=recording.task_name,
             task_tools=recording.task_tools,
             original_environments=recording.original_environments,
+            state=recording.state,
+            target=Target(target) if target is not None else None,
         )
     return report
 
@@ -175,6 +185,8 @@ async def _replay_into(
     task_name: str,
     task_tools: Sequence[Tool] = (),
     original_environments: Mapping[str, SandboxEnvironment] | None = None,
+    state: TaskState | None = None,
+    target: Target | None = None,
 ) -> None:
     adapter = config.adapter or adapter_for(pristine.sandbox.type)
     report.sandbox_type, report.adapter = pristine.sandbox.type, adapter.name
@@ -214,12 +226,12 @@ async def _replay_into(
                 f"{len(diverged)} call output divergence(s) from the recording: "
                 + ", ".join(diverged)
             )
-        sandboxes = Sandboxes(environments)
-        outcomes = [await c.run(sandboxes) for c in checks if c.phase == "live"]
+        sandboxes = Sandboxes(environments, state=state, target=target)
+        report.checks = [await c.run(sandboxes) for c in checks if c.phase == "live"]
         with stage(f"adapter '{adapter.name}' could not freeze the replay sandbox"):
             reader = await adapter.freeze(environments, report.notes)
-        outcomes += [await c.run(reader) for c in checks if c.phase == "evidence"]
-    report.judge(outcomes)
+        report.checks += [await c.run(reader) for c in checks if c.phase == "evidence"]
+    report.judge(report.checks)
 
 
 @dataclass(frozen=True, kw_only=True, slots=True)
@@ -260,7 +272,8 @@ async def _reissue(
     try:
         with anyio.fail_after(config.call_timeout):
             outcome = await _execute(call, environments, tools)
-    except Inconclusive:
+    except Inconclusive as ex:
+        record.reason = str(ex)
         raise
     except TimeoutError as ex:
         raise Inconclusive(f"{label} exceeded {config.call_timeout}s") from ex
@@ -310,7 +323,10 @@ async def _execute_tool(call: RecordedCall, tools: Mapping[str, Tool]) -> _Outco
     # once with approval, and no human is asked again.
     approve_all = [ApprovalPolicy(auto_approver(), "*")]
     result = await execute_tools([message], [tool], approval=approve_all)
-    [reply] = [m for m in result.messages if isinstance(m, ChatMessageTool)]
+    replies = [m for m in result.messages if isinstance(m, ChatMessageTool)]
+    if len(replies) != 1:
+        raise RuntimeError(f"tool '{call.function}' returned {len(replies)} results, not one")
+    [reply] = replies
     return _Outcome(
         status=reply.error.type if reply.error else None,
         output=reply.text,

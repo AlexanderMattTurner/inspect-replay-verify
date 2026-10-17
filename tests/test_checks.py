@@ -90,3 +90,18 @@ async def test_evidence_an_adapter_will_not_freeze_is_never_read(
     )
     assert (report.verdict, reads, report.notes["froze"]) == ("inconclusive", [], False)
     assert explanation in report.explanation
+    assert [(o.name, o.passed) for o in report.checks] == [("true", True)]
+
+
+def test_a_phase_outside_the_two_is_refused() -> None:
+    async def ok(target: object) -> bool:
+        return True
+
+    with pytest.raises(ValueError, match="phase is one of"):
+        irv.custom_check(ok, phase="Evidence")  # type: ignore[arg-type]
+
+
+def test_no_outcome_at_all_is_never_a_pass() -> None:
+    report = irv.ReplayReport()
+    report.judge([])
+    assert report.verdict == "inconclusive"

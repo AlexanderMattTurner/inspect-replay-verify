@@ -83,6 +83,10 @@ class ReplayReport:
     def judge(self, outcomes: Sequence[CheckOutcome]) -> None:
         """Set the verdict from the checks of a complete replay."""
         self.checks = list(outcomes)
+        if not outcomes:
+            self.verdict = "inconclusive"
+            self.explanation = "no ground-truth check produced an outcome"
+            return
         failed = [o for o in outcomes if o.passed is False]
         unknown = [o for o in outcomes if o.passed is None]
         if failed:

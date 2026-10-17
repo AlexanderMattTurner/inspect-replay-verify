@@ -7,10 +7,30 @@ from typing import Any
 import anyio
 from inspect_ai.dataset import Sample
 from inspect_ai.log import EvalLog, EvalSample, read_eval_log, resolve_sample_attachments
+from inspect_ai.model import ModelName
+from inspect_ai.scorer import Target
+from inspect_ai.solver import TaskState
 
 from .replay import ChecksArg, Recording, ReplayConfig, ReplayContext, verify
 from .report import ReplayReport
 from .sandbox import release_task
+
+
+def logged_state(eval_log: EvalLog, logged: EvalSample) -> TaskState:
+    """The `TaskState` a scorer sees for a logged sample, rebuilt as `inspect score` does."""
+    return TaskState(
+        model=ModelName(eval_log.eval.model),
+        sample_id=logged.id,
+        epoch=logged.epoch,
+        input=logged.input,
+        target=Target(logged.target),
+        choices=logged.choices,
+        messages=logged.messages,
+        output=logged.output,
+        completed=True,
+        metadata=logged.metadata,
+        store=logged.store,
+    )
 
 
 def logged_recording(
@@ -39,6 +59,7 @@ def logged_recording(
         missing="" if sample else "the sample shipped files the log does not keep; pass dataset=",
         task_name=eval_log.eval.task,
         task_sandbox=eval_log.eval.sandbox,
+        state=logged_state(eval_log, logged),
         context=ReplayContext(sample_id=logged.id, metadata=logged.metadata, target=logged.target),
     )
 
@@ -47,32 +68,33 @@ async def replay_log_async(
     log: EvalLog | str | Path,
     checks: ChecksArg,
     *,
+    config: ReplayConfig | None = None,
     dataset: Iterable[Sample] | None = None,
     sample_ids: Iterable[str | int] | None = None,
-    **options: Any,
 ) -> dict[tuple[str | int, int], ReplayReport]:
     """Replay every sample of a finished log; reports keyed by (sample id, epoch).
 
     Args:
       log: The log, or a path to it.
       checks: As for `replay_scorer`.
+      config: How to replay. With no `tools`, calls are re-issued through Inspect's
+        standard sandbox tools with default parameters.
       dataset: The task's samples, for their files (a log keeps only file names). A sample
         that shipped files and has no dataset entry is reported inconclusive.
       sample_ids: Only replay these samples.
-      **options: `ReplayConfig` fields. With no `tools`, calls are re-issued through
-        Inspect's standard sandbox tools with default parameters.
     """
-    config = ReplayConfig(**options)
+    config = config or ReplayConfig()
     eval_log = log if isinstance(log, EvalLog) else read_eval_log(str(log))
     by_id = {s.id: s for s in (dataset or [])}
     wanted = set(sample_ids) if sample_ids is not None else None
     reports: dict[tuple[str | int, int], ReplayReport] = {}
-    for logged in eval_log.samples or []:
-        if wanted is None or logged.id in wanted:
-            recording = logged_recording(eval_log, logged, by_id)
-            reports[(logged.id, logged.epoch)] = await verify(recording, checks, config)
-
-    await release_task(eval_log.eval.task)
+    try:
+        for logged in eval_log.samples or []:
+            if wanted is None or logged.id in wanted:
+                recording = logged_recording(eval_log, logged, by_id)
+                reports[(logged.id, logged.epoch)] = await verify(recording, checks, config)
+    finally:
+        await release_task(eval_log.eval.task)
     return reports
 
 

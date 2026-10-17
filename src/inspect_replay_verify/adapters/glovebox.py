@@ -87,7 +87,7 @@ class GloveboxAdapter(ReplayAdapter):
 
     def session_identifiers(self, environments: Mapping[str, SandboxEnvironment]) -> list[str]:
         runs = (_run_of(env) for env in environments.values())
-        return [run.name for run in runs if run is not None and isinstance(run.name, str)]
+        return [name for run in runs if isinstance(name := getattr(run, "name", None), str)]
 
     async def freeze(
         self, environments: Mapping[str, SandboxEnvironment], notes: dict[str, Any]
@@ -104,19 +104,19 @@ class GloveboxAdapter(ReplayAdapter):
             try:
                 result = await self.quiesce(run)
             except Exception as ex:
-                reasons.append(f"{run.name}: quiesce raised {ex!r}")
+                reasons.append(f"{getattr(run, 'name', '?')}: quiesce raised {ex!r}")
                 continue
             established = bool(getattr(result, "established", False))
             notes["quiescence"].append(
                 {
-                    "run": run.name,
+                    "run": getattr(run, "name", None),
                     "established": established,
                     "why": getattr(result, "why", ""),
                     "survivors": list(getattr(result, "survivors", ())),
                 }
             )
             if not established:
-                reasons.append(f"{run.name}: {getattr(result, 'why', '')}")
+                reasons.append(f"{getattr(run, 'name', '?')}: {getattr(result, 'why', '')}")
         if reasons:
             raise Inconclusive("guest quiescence was not confirmed (" + "; ".join(reasons) + ")")
         return GloveboxEvidenceReader(self, environments)

@@ -16,11 +16,16 @@ import hashlib
 import re
 from collections.abc import Awaitable, Callable, Mapping, Sequence
 from dataclasses import dataclass, field
-from typing import Any, Literal, Protocol
+from typing import Any, Literal, Protocol, get_args
 
+from inspect_ai.scorer import NOANSWER, Score, Scorer, Target, value_to_float
+from inspect_ai.solver import TaskState
 from inspect_ai.util import SandboxEnvironment
 
+from . import _inspect_compat as compat
+
 Phase = Literal["live", "evidence"]
+PHASES: tuple[str, ...] = get_args(Phase)
 
 
 @dataclass(frozen=True, kw_only=True, slots=True)
@@ -35,10 +40,19 @@ class CheckOutcome:
 
 
 class Sandboxes:
-    """The replay's running sandboxes, by name; the first is the default."""
+    """The replay's running sandboxes, by name (the first is the default), and the sample
+    they replay, for checks that grade like a scorer."""
 
-    def __init__(self, environments: Mapping[str, SandboxEnvironment]) -> None:
+    def __init__(
+        self,
+        environments: Mapping[str, SandboxEnvironment],
+        *,
+        state: TaskState | None = None,
+        target: Target | None = None,
+    ) -> None:
         self._environments = environments
+        self.state = state
+        self.target = target
 
     def environment(self, name: str | None = None) -> SandboxEnvironment:
         if name is None or name == "default":
@@ -65,6 +79,10 @@ class Check:
     name: str
     phase: Phase
     observe: Observe
+
+    def __post_init__(self) -> None:
+        if self.phase not in PHASES:
+            raise ValueError(f"a check's phase is one of {PHASES}, not {self.phase!r}")
 
     async def run(self, target: Any) -> CheckOutcome:
         """The observation; a raise is an inconclusive outcome, never a pass."""
@@ -215,3 +233,38 @@ def file_contains(
         return found, f"{'found' if found else 'did not find'} {pattern!r}", {}
 
     return _file_check(path, name or f"contains({path}, {pattern!r})", sandbox, judge)
+
+
+def scorer_check(
+    scorer: Scorer,
+    *,
+    name: str | None = None,
+    passing: float = 1.0,
+) -> Check:
+    """Any Inspect `Scorer` as a check: it grades the replay sandbox, not the original.
+
+    The scorer runs in the live phase with `sandbox()` bound to the replay, on the
+    sample's `TaskState` and `Target`, so a task's own scorer re-grades what an
+    independent replay did. A value of at least `passing` (after Inspect's
+    `value_to_float`) passes; `NOANSWER` means the scorer could not tell.
+    """
+    label = name or compat.registry_name(scorer) or "scorer"
+    to_float = value_to_float()
+
+    async def observe(target: Sandboxes) -> CheckOutcome:
+        if target.state is None or target.target is None:
+            return CheckOutcome(
+                name=label, passed=None, explanation="no TaskState to run the scorer with"
+            )
+        score: Score | None = await scorer(target.state, target.target)
+        if score is None or score.value == NOANSWER:
+            return CheckOutcome(name=label, passed=None, explanation="the scorer gave no answer")
+        value = to_float(score.value)
+        return CheckOutcome(
+            name=label,
+            passed=value >= passing,
+            explanation=score.explanation or f"scored {score.value!r}",
+            observed={"value": score.value, "answer": score.answer},
+        )
+
+    return Check(name=label, phase="live", observe=observe)

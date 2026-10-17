@@ -52,8 +52,14 @@ async def running_task_sandbox() -> SandboxEnvironmentSpec | None:
     return _task_sandboxes[location]
 
 
-async def live_recording(state: TaskState, target: Target) -> Recording:
-    """The running sample's recording: its transcript so far and its pristine `Sample`."""
+async def live_recording(
+    state: TaskState, target: Target, *, task_sandbox: bool = True
+) -> Recording:
+    """The running sample's recording: its transcript so far and its pristine `Sample`.
+
+    With `task_sandbox=False` the task-level sandbox is not read back from the log header
+    (a caller overriding it has no use for it).
+    """
     events = list(transcript().events)
     count = getattr(getattr(transcript(), "history", None), "event_count", None)
     sample = compat.active_sample()
@@ -74,11 +80,12 @@ async def live_recording(state: TaskState, target: Target) -> Recording:
         sample=sample,
         missing=missing,
         task_name=compat.active_task_name() or "replay",
-        task_sandbox=await running_task_sandbox(),
+        task_sandbox=await running_task_sandbox() if task_sandbox else None,
         task_tools=state.tools,
         original_environments={
             k: compat.unproxy(v) for k, v in compat.current_environments().items()
         },
+        state=state,
         context=ReplayContext(
             sample_id=state.sample_id, metadata=state.metadata, target=target.target
         ),
@@ -123,7 +130,8 @@ def replay_scorer(
     replay produced. The original run's own claims and its sandbox are never consulted.
 
     Args:
-      checks: Ground-truth checks (see `inspect_replay_verify.checks`), or a function of
+      checks: Ground-truth checks (see `inspect_replay_verify.checks`; `scorer_check`
+        turns any Inspect scorer, the task's own included, into one), or a function of
         `ReplayContext` returning them per sample.
       inconclusive_value: Score value for an inconclusive replay (never a pass).
       sandbox, tools, adapter, skip_tools, untranscribed, on_divergence, call_timeout,
@@ -142,7 +150,8 @@ def replay_scorer(
     )
 
     async def score(state: TaskState, target: Target) -> Score:
-        report = await verify(await live_recording(state, target), checks, config)
+        recording = await live_recording(state, target, task_sandbox=sandbox is None)
+        report = await verify(recording, checks, config)
         original = {k: v.value for k, v in (state.scores or {}).items()}
         return score_from_report(
             report,

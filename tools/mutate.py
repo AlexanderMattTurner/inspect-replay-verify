@@ -151,8 +151,8 @@ MUTANTS = [
     ),
     Mutant(
         file="replay.py",
-        old='        outcomes = [await c.run(sandboxes) for c in checks if c.phase == "live"]',
-        new="        outcomes = []",
+        old='        report.checks = [await c.run(sandboxes) for c in checks if c.phase == "live"]',
+        new="        report.checks = []",
         breaks="live checks never run",
     ),
     Mutant(
@@ -166,6 +166,30 @@ MUTANTS = [
         old='        raise Inconclusive(f"{what}: {type(ex).__name__}: {ex}") from ex',
         new="        raise",
         breaks="a failing stage escapes as an error instead of an inconclusive verdict",
+    ),
+    Mutant(
+        file="report.py",
+        old='        if not outcomes:\n            self.verdict = "inconclusive"',
+        new='        if False:\n            self.verdict = "inconclusive"',
+        breaks="no outcome at all is a pass",
+    ),
+    Mutant(
+        file="checks.py",
+        old="        if self.phase not in PHASES:",
+        new="        if False:",
+        breaks="a misspelt phase silently drops its check",
+    ),
+    Mutant(
+        file="checks.py",
+        old="            passed=value >= passing,",
+        new="            passed=True,",
+        breaks="a scorer check passes whatever the scorer said",
+    ),
+    Mutant(
+        file="checks.py",
+        old="        if score is None or score.value == NOANSWER:",
+        new="        if False:",
+        breaks="a scorer that could not tell counts as a verdict",
     ),
     Mutant(
         file="scorer.py",

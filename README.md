@@ -77,7 +77,9 @@ Any of these makes the verdict inconclusive:
 - Only part of the transcript is readable (a bounded transcript with evicted events).
 
 Each score's `metadata["replay"]` records every call's disposition, whether it diverged,
-every check's observation, and adapter notes such as the quiescence census. The scorer
+every check's observation, and adapter notes such as the quiescence census. The replay
+itself appears in the sample's transcript as a `replay_verify` span, holding every
+re-issued tool call and every command the replay sandbox ran. The scorer
 also reports the metrics `verified_rate`, `refuted_rate` and `inconclusive_rate`. Any
 scores the run already had are copied to `metadata["original_scores"]` for comparison.
 
@@ -164,6 +166,15 @@ adapter may freeze the sandbox between the two phases.
 To stop an agent from passing by rewriting its own tests, pass `restore_files=` to a live
 check. Pristine copies are then written over the agent's files before the check runs.
 
+To re-grade the replay with an Inspect scorer you already have, the task's own
+included, wrap it in `scorer_check(scorer)`. It runs in the live phase on the sample's
+`TaskState` with `sandbox()` bound to the replay, so the same grader that passed the
+original sandbox now judges what an independent replay did:
+
+```python
+replay_scorer([scorer_check(my_task_scorer())])
+```
+
 Every check is a `Check(name=..., phase=..., observe=...)`, and the built-ins above are
 just constructors for one. `custom_check(fn, phase=...)` wraps your own async function.
 A live check's function receives `Sandboxes` (`.environment(name)`), and an evidence
@@ -188,8 +199,10 @@ for (sample_id, epoch), report in reports.items():
 
 A log records the *names* of a sample's files, not their contents. A sample that shipped
 files therefore needs its `dataset=` entry, and without one it is reported inconclusive.
-The task's sandbox comes from the log header. Every other keyword is a `ReplayConfig`
-field, as for `replay_scorer`, such as `sandbox=` or `untranscribed=`.
+The task's sandbox comes from the log header. Pass `config=ReplayConfig(...)` to set
+anything `replay_scorer` takes, such as `sandbox=` or `untranscribed=`. Each logged
+sample's `TaskState` is rebuilt the way `inspect score` rebuilds it, so `scorer_check`
+works offline too.
 
 ## Building on the pieces
 
@@ -198,7 +211,8 @@ The scorer and `replay_log` are thin. Each turns what a run left behind into a
 and calls `verify(recording, checks, ReplayConfig(...))`. Pass your own `Recording` to
 verify a run from elsewhere. Below that, `replay(calls, pristine, checks, config)`
 re-issues calls you already have, and the `booted(pristine, task_name)` context manager
-gives you a fresh pristine sandbox. Any step that cannot stand for the original raises
+gives you a fresh pristine sandbox through Inspect's own sample lifecycle
+(`release_task` frees what it initialised). Any step that cannot stand for the original raises
 `Inconclusive`, and the report turns it into the verdict.
 
 ## Backends

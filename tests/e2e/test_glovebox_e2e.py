@@ -60,3 +60,16 @@ def test_the_original_microvm_is_untouched_by_the_replay() -> None:
     )
     assert value(log, "file_is") == CORRECT
     assert replay_meta(log)["verdict"] == "verified", replay_meta(log)["explanation"]
+
+
+def test_the_tasks_own_scorer_regrades_a_microvm_replay() -> None:
+    log = run(
+        ["printf hello > out.txt"],
+        [
+            file_is("out.txt", "hello"),
+            irv.replay_scorer([irv.scorer_check(file_is("out.txt", "hello"))]),
+        ],
+        sandbox="glovebox",
+    )
+    assert value(log, "file_is") == CORRECT
+    assert replay_meta(log)["verdict"] == "verified", replay_meta(log)["explanation"]
