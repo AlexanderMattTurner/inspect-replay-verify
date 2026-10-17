@@ -1,7 +1,5 @@
 """Verdict-rate metrics over replay scores."""
 
-from __future__ import annotations
-
 from inspect_ai.scorer import Metric, SampleScore, metric
 
 

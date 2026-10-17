@@ -1,9 +1,8 @@
 """The replay engine: pristine sandbox, mechanical re-issue, independent checks, verdict."""
 
-from __future__ import annotations
-
 import contextlib
 import logging
+import shlex
 from collections.abc import Callable, Mapping, Sequence
 from dataclasses import asdict, dataclass, field
 from typing import Any, Literal, cast
@@ -27,7 +26,7 @@ OnDivergence = Literal["record", "inconclusive"]
 _OUTPUT_PREVIEW = 1000
 
 
-@dataclass(frozen=True)
+@dataclass(frozen=True, kw_only=True, slots=True)
 class PristineState:
     """Everything needed to boot a sandbox exactly as the original sample started."""
 
@@ -38,7 +37,7 @@ class PristineState:
     sample_id: str | int | None = None
 
 
-@dataclass(frozen=True)
+@dataclass(frozen=True, kw_only=True, slots=True)
 class ReplayContext:
     """What a per-sample check factory sees."""
 
@@ -50,7 +49,7 @@ class ReplayContext:
 ChecksArg = Sequence[Check] | Callable[[ReplayContext], Sequence[Check]]
 
 
-@dataclass
+@dataclass(kw_only=True, slots=True)
 class CallReplay:
     """How one recorded call fared on replay."""
 
@@ -67,7 +66,7 @@ class CallReplay:
     replay_output: str | None = None
 
 
-@dataclass
+@dataclass(kw_only=True)
 class ReplayReport:
     """The outcome of one independent replay."""
 
@@ -201,6 +200,64 @@ async def _pristine(environments: dict[str, SandboxEnvironment], pristine: Prist
         await compat.setup_sandbox_environment(pristine.setup, environments)
     for env in environments.values():
         await compat.resolve_root_access(env)
+
+
+class _Unavailable(Exception):
+    """The replay has no way to re-issue this action."""
+
+
+@dataclass(frozen=True, kw_only=True, slots=True)
+class _Replayed:
+    status: str | None
+    """The outcome class: a tool error type, an `exec`'s non-zero exit, or None for success."""
+    output: str
+    error: str | None = None
+
+
+def _recorded_status(call: RecordedCall) -> str | None:
+    if call.kind == "exec":
+        return f"exit {call.returncode}" if call.returncode else None
+    return call.error.type if call.error else None
+
+
+async def _reissue_action(
+    call: RecordedCall,
+    environments: Mapping[str, SandboxEnvironment],
+    tools: Mapping[str, Tool],
+    timeout: float | None,
+) -> _Replayed:
+    if call.kind == "tool":
+        tool = tools.get(call.function)
+        if tool is None:
+            raise _Unavailable(f"tool '{call.function}' is unavailable to the replay")
+        reply = await _reissue(call, tool, timeout)
+        return _Replayed(
+            status=reply.error.type if reply.error else None,
+            output=reply.text,
+            error=_render(reply.error),
+        )
+    if len(environments) > 1:
+        raise _Unavailable(
+            "the transcript does not record which of the sample's sandboxes ran this action"
+        )
+    env = next(iter(environments.values()))
+    args = call.arguments
+    with anyio.fail_after(timeout):
+        if call.kind == "write_file":
+            await env.write_file(str(args["file"]), str(args["contents"] or ""))
+            return _Replayed(status=None, output="")
+        result = await env.exec(
+            shlex.split(str(args["cmd"])),
+            input=args.get("input"),
+            cwd=args.get("cwd"),
+            env=args.get("env") or {},
+            user=args.get("user"),
+            timeout=args.get("timeout"),
+        )
+    return _Replayed(
+        status=f"exit {result.returncode}" if result.returncode else None,
+        output=result.stdout + result.stderr,
+    )
 
 
 async def _reissue(call: RecordedCall, tool: Tool, timeout: float | None) -> ChatMessageTool:
@@ -359,14 +416,13 @@ async def _replay_in(
             continue
         if recorded.disposition == "unreproducible":
             return stop(f"call {recorded.id} ({recorded.function}): {recorded.reason}", results)
-        tool = tools.get(recorded.function)
-        if tool is None:
-            record.reason = "no tool by this name is available to the replay"
-            return stop(f"call {recorded.id}: tool '{recorded.function}' is unavailable", results)
         call = adapter.rewrite_call(recorded)
         record.credential_scoped = bool(adapter.credentials_in(call))
         try:
-            reply = await _reissue(call, tool, call_timeout)
+            replayed = await _reissue_action(call, environments, tools, call_timeout)
+        except _Unavailable as ex:
+            record.reason = str(ex)
+            return stop(f"call {recorded.id}: {ex}", results)
         except TimeoutError:
             return stop(
                 f"call {recorded.id} ({recorded.function}) exceeded {call_timeout}s", results
@@ -375,22 +431,27 @@ async def _replay_in(
             record.replay_error = f"{type(ex).__name__}: {ex}"
             return stop(f"call {recorded.id} ({recorded.function}) raised on replay: {ex}", results)
         record.replayed = True
-        record.replay_error = _render(reply.error)
-        output = reply.text
-        record.replay_output = output[:_OUTPUT_PREVIEW]
-        same_error = (reply.error.type if reply.error else None) == (
-            recorded.error.type if recorded.error else None
-        )
-        same_output = adapter.normalize(output, identifiers) == adapter.normalize(
-            recorded.result, identifiers
-        )
-        record.diverged = not (same_error and same_output)
+        record.replay_error = replayed.error
+        record.replay_output = replayed.output[:_OUTPUT_PREVIEW]
+        if replayed.status != _recorded_status(recorded):
+            # An outcome the original did not have is a replay that did not reproduce it,
+            # whatever the cause, so nothing it leaves behind can stand for the original.
+            record.diverged = True
+            return stop(
+                f"call {recorded.id} ({recorded.function}) ended "
+                f"{replayed.status or 'ok'} on replay but {_recorded_status(recorded) or 'ok'} "
+                "in the original",
+                results,
+            )
+        record.diverged = recorded.kind == "tool" and adapter.normalize(
+            replayed.output, identifiers
+        ) != adapter.normalize(recorded.result, identifiers)
 
     diverged = [c for c in results if c.diverged and not c.credential_scoped]
     if diverged and on_divergence == "inconclusive":
         return stop(
-            f"{len(diverged)} replayed call(s) observed output that differs from the "
-            "recording: " + ", ".join(c.id for c in diverged),
+            f"{len(diverged)} call output divergence(s) from the recording: "
+            + ", ".join(c.id for c in diverged),
             results,
         )
 

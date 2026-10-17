@@ -1,7 +1,5 @@
 """Verify a finished `.eval` log after the fact, from any sandbox provider."""
 
-from __future__ import annotations
-
 import logging
 from collections.abc import Iterable, Mapping, Sequence
 from pathlib import Path
@@ -24,7 +22,7 @@ from .replay import (
     task_cleanup,
 )
 from .scorer import as_spec, pristine_state, resolve_tools
-from .transcript import DEFAULT_SKIP_TOOLS, recorded_calls
+from .transcript import DEFAULT_SKIP_TOOLS, Untranscribed, recorded_calls
 
 logger = logging.getLogger(__name__)
 
@@ -58,6 +56,7 @@ async def replay_log_async(
     tools: Sequence[Tool] | None = None,
     adapter: ReplayAdapter | None = None,
     skip_tools: Iterable[str] = DEFAULT_SKIP_TOOLS,
+    untranscribed: Untranscribed = "inconclusive",
     on_divergence: OnDivergence = "record",
     call_timeout: float | None = None,
     sample_ids: Iterable[str | int] | None = None,
@@ -72,7 +71,8 @@ async def replay_log_async(
       sandbox: Override the task-level sandbox recorded in the log.
       tools: Tools to re-issue calls with. Defaults to Inspect's standard sandbox tools
         with default parameters; pass the agent's own when they were configured.
-      adapter, skip_tools, on_divergence, call_timeout: As for `replay_scorer`.
+      adapter, skip_tools, untranscribed, on_divergence, call_timeout: As for
+        `replay_scorer`.
       sample_ids: Only replay these samples.
     """
     eval_log = log if isinstance(log, EvalLog) else read_eval_log(str(log))
@@ -89,7 +89,10 @@ async def replay_log_async(
             continue
         logged = resolve_sample_attachments(logged, True)
         calls, source = recorded_calls(
-            events=logged.events, messages=logged.messages, skip_tools=skip_tools
+            events=logged.events,
+            messages=logged.messages,
+            skip_tools=skip_tools,
+            untranscribed=untranscribed,
         )
         source_sample = _pristine_sample(logged, by_id)
         pristine = (

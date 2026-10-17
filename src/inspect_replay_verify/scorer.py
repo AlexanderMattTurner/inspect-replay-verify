@@ -1,7 +1,6 @@
 """`replay_scorer()`: grade a sample on an independent replay, not on its own transcript."""
 
-from __future__ import annotations
-
+import logging
 from collections.abc import Iterable, Mapping, Sequence
 from typing import Any
 
@@ -37,7 +36,7 @@ from .replay import (
     replay,
     resolve_checks,
 )
-from .transcript import DEFAULT_SKIP_TOOLS, recorded_calls
+from .transcript import DEFAULT_SKIP_TOOLS, Untranscribed, recorded_calls
 
 
 def as_spec(sandbox: SandboxEnvironmentType | None) -> SandboxEnvironmentSpec | None:
@@ -74,6 +73,7 @@ async def pristine_state(
     )
 
 
+logger = logging.getLogger(__name__)
 _task_sandboxes: dict[str, SandboxEnvironmentSpec | None] = {}
 
 
@@ -91,7 +91,8 @@ async def running_task_sandbox() -> SandboxEnvironmentSpec | None:
         try:
             header = await read_eval_log_async(location, header_only=True)
             _task_sandboxes[location] = header.eval.sandbox
-        except Exception:
+        except Exception as ex:
+            logger.warning("could not read the task sandbox from %s: %r", location, ex)
             return None
     return _task_sandboxes[location]
 
@@ -136,6 +137,7 @@ def replay_scorer(
     tools: Sequence[Tool] | None = None,
     adapter: ReplayAdapter | None = None,
     skip_tools: Iterable[str] = DEFAULT_SKIP_TOOLS,
+    untranscribed: Untranscribed = "inconclusive",
     on_divergence: OnDivergence = "record",
     call_timeout: float | None = None,
     inconclusive_value: Value = NOANSWER,
@@ -160,6 +162,9 @@ def replay_scorer(
         with `react(tools=...)`.
       adapter: Backend adapter; chosen by sandbox type when omitted.
       skip_tools: Tool names never re-issued (no sandbox effect).
+      untranscribed: What a sandbox action no tool call made (a solver's own
+        `sandbox().exec`) does to the replay: ``"inconclusive"`` refuses to judge,
+        ``"replay"`` re-issues it in order, ``"ignore"`` leaves it out.
       on_divergence: ``"record"`` notes calls whose replayed output differs from the
         recording; ``"inconclusive"`` refuses to judge such a replay.
       call_timeout: Wall-clock bound per re-issued call, beyond the tool's own timeout.
@@ -172,7 +177,10 @@ def replay_scorer(
         history = getattr(transcript(), "history", None)
         count = getattr(history, "event_count", None)
         calls, source = recorded_calls(
-            events=events, messages=state.messages, skip_tools=skip_tools
+            events=events,
+            messages=state.messages,
+            skip_tools=skip_tools,
+            untranscribed=untranscribed,
         )
         sample = compat.active_sample()
         task_name = compat.active_task_name() or "replay"

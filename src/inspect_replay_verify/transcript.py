@@ -1,61 +1,61 @@
-"""Turn a sample's recorded transcript into the ordered list of tool calls to re-issue.
+"""Turn a sample's transcript into the ordered list of actions a replay re-issues.
 
-The source of truth is the sample's `ToolEvent`s, which Inspect records for every tool
-execution — including calls made inside sub-agents, which never reach `state.messages`.
-When a transcript carries no tool events (a condensed log, a hand-built state), the
-assistant messages' `tool_calls` and their `ChatMessageTool` replies are used instead.
-
-Each call gets a disposition:
-
-- ``replay``: it executed in the original run and is re-issued.
-- ``skip``: it never touched the sandbox, or never executed at all (a parse error, an
-  approver's rejection, an agent handoff whose own inner calls are listed separately, a
-  tool named in ``skip_tools``). Re-issuing it would do something the original did not.
-- ``unreproducible``: it may have had a partial or unknown effect (cancelled mid-flight,
-  the sandbox vanished, the call never completed). No replay past it can claim to start
-  from the original's state, so the replay stops there and the verdict is inconclusive.
+Tool calls come from the sample's `ToolEvent`s, which include calls made inside
+sub-agents; a transcript with none falls back to the assistant messages. Sandbox actions
+no tool call made (a solver's `sandbox().exec`, an agent running inside the sandbox) come
+from its `SandboxEvent`s, and `untranscribed` decides what becomes of them.
 """
-
-from __future__ import annotations
 
 from collections.abc import Iterable, Sequence
 from dataclasses import dataclass, field
-from typing import Any, Literal
+from datetime import datetime
+from typing import Any, Literal, get_args
 
-from inspect_ai.event import SpanBeginEvent, ToolEvent
+from inspect_ai.event import ModelEvent, SandboxEvent, SpanBeginEvent, ToolEvent
 from inspect_ai.model import ChatMessage, ChatMessageAssistant, ChatMessageTool
 from inspect_ai.tool import ToolCallError
 
 Disposition = Literal["replay", "skip", "unreproducible"]
+"""``replay`` re-issues it; ``skip`` leaves out what never ran or never touched the
+sandbox; ``unreproducible`` stops the replay, which is then inconclusive."""
 
-# Tools that, by default, have no effect on sandbox state worth reproducing (or whose
-# effect is outside the sandbox and non-deterministic), so a replay leaves them out.
+Kind = Literal["tool", "exec", "write_file"]
+Untranscribed = Literal["inconclusive", "replay", "ignore"]
+
 DEFAULT_SKIP_TOOLS: frozenset[str] = frozenset(
-    {
-        "think",
-        "submit",
-        "web_search",
-        "ask_user",
-        "notify_user",
-        "update_plan",
-        "todo_write",
-        "memory",
-    }
+    {"think", "submit", "web_search", "ask_user", "notify_user", "update_plan", "todo_write"}
 )
 
-# Span type this package's own replays run under, so a later read of the same transcript
-# never mistakes a replayed call for one the agent made.
+# The span this package's replays run under, so no later read mistakes one for the agent.
 REPLAY_SPAN_TYPE = "replay_verify"
 
-# Error types meaning the tool body never ran.
-_NOT_EXECUTED = frozenset({"parsing", "approval"})
-# Error types meaning the tool may have had a partial or unknown effect.
-_UNKNOWN_EFFECT = frozenset({"cancelled", "sandbox_unavailable"})
+# What each `ToolCallError.type` says about the original call's effect. A type missing
+# here (a newer Inspect) is unreproducible: an effect nobody classified is unknown.
+ERROR_DISPOSITIONS: dict[str, tuple[Disposition, str]] = {
+    "parsing": ("skip", "never executed in the original (parsing error)"),
+    "approval": ("skip", "never executed in the original (approval error)"),
+    "cancelled": ("unreproducible", "original call was cancelled mid-flight"),
+    "sandbox_unavailable": ("unreproducible", "original call lost its sandbox"),
+    "timeout": ("replay", ""),
+    "unicode_decode": ("replay", ""),
+    "permission": ("replay", ""),
+    "file_not_found": ("replay", ""),
+    "is_a_directory": ("replay", ""),
+    "limit": ("replay", ""),
+    "output_limit": ("replay", ""),
+    "unknown": ("replay", ""),
+}
+
+ERROR_TYPES: tuple[str, ...] = get_args(ToolCallError.__annotations__["type"])
+
+# How `SandboxEvent` renders content it cut short (inspect_ai.util._sandbox.events).
+_TRUNCATED = "\n\nOutput truncated ("
+_BINARY = "binary ("
 
 
-@dataclass(frozen=True)
+@dataclass(frozen=True, kw_only=True, slots=True)
 class RecordedCall:
-    """One tool call as the original run recorded it."""
+    """One action as the original run recorded it."""
 
     id: str
     function: str
@@ -64,12 +64,15 @@ class RecordedCall:
     error: ToolCallError | None
     disposition: Disposition
     reason: str = ""
+    kind: Kind = "tool"
+    returncode: int | None = None
+    """An `exec`'s recorded exit status."""
     nondeterministic: bool = False
-    """The call timed out in the original, so its partial effect may not repeat exactly."""
+    """The original timed out, so its partial effect may not repeat exactly."""
     extra: dict[str, Any] = field(default_factory=dict)
 
 
-def result_text(result: Any) -> str:
+def result_text(result: object) -> str:
     """A tool result (str, number, Content or list of Content) rendered as text."""
     if result is None:
         return ""
@@ -95,60 +98,134 @@ def _classify(
         return "skip", "agent handoff; the agent's own tool calls are replayed individually"
     if incomplete:
         return "unreproducible", "the original call never completed"
-    if error is not None and error.type in _NOT_EXECUTED:
-        return "skip", f"never executed in the original ({error.type} error)"
-    if error is not None and error.type in _UNKNOWN_EFFECT:
-        return "unreproducible", f"original call had an unknown effect ({error.type})"
+    if error is not None:
+        disposition, reason = ERROR_DISPOSITIONS.get(
+            error.type, ("unreproducible", f"unclassified error type '{error.type}'")
+        )
+        if disposition != "replay":
+            return disposition, reason
     if function in skip_tools:
         return "skip", f"'{function}' is in skip_tools"
     return "replay", ""
 
 
-def _outside_agent_spans(events: list[Any]) -> list[ToolEvent]:
-    """The tool events the agent made: none from scoring, none from an earlier replay."""
-    spans: dict[str, SpanBeginEvent] = {e.id: e for e in events if isinstance(e, SpanBeginEvent)}
+class _Spans:
+    """Which events the agent caused: none from init, scoring, a tool body or a replay."""
 
-    def excluded(span_id: str | None) -> bool:
+    def __init__(self, events: Sequence[object]) -> None:
+        self._spans = {e.id: e for e in events if isinstance(e, SpanBeginEvent)}
+
+    def _types(self, span_id: str | None) -> set[str]:
+        found: set[str] = set()
         seen: set[str] = set()
         while span_id is not None and span_id not in seen:
-            seen.add(span_id)
-            begin = spans.get(span_id)
+            begin = self._spans.get(span_id)
             if begin is None:
-                return False
-            if begin.type in ("scorer", REPLAY_SPAN_TYPE) or begin.name == "scorers":
-                return True
+                break
+            seen.add(span_id)
+            found.update(t for t in (begin.type, begin.name) if t)
             span_id = begin.parent_id
-        return False
+        return found
 
-    return [e for e in events if isinstance(e, ToolEvent) and not excluded(e.span_id)]
+    def outside_scoring(self, span_id: str | None) -> bool:
+        return not self._types(span_id) & {"scorer", "scorers", REPLAY_SPAN_TYPE}
+
+    def untranscribed(self, span_id: str | None) -> bool:
+        types = self._types(span_id)
+        return not types & {"scorer", "scorers", REPLAY_SPAN_TYPE, "tool", "init"}
+
+
+def _tool_call(event: ToolEvent, skip: frozenset[str]) -> RecordedCall:
+    handoff = bool(event.agent or event.agent_span_id)
+    disposition, reason = _classify(
+        event.function,
+        event.error,
+        skip_tools=skip,
+        handoff=handoff,
+        incomplete=bool(event.pending) or bool(event.failed),
+    )
+    if event.failed and not handoff:
+        reason = "the original call failed with a hard error"
+    return RecordedCall(
+        id=event.id,
+        function=event.function,
+        arguments=dict(event.arguments),
+        result=result_text(event.result),
+        error=event.error,
+        disposition=disposition,
+        reason=reason,
+        nondeterministic=event.error is not None and event.error.type == "timeout",
+    )
+
+
+def _overlaps_model(event: SandboxEvent, model_starts: Sequence[datetime]) -> bool:
+    if event.completed is None:
+        return False
+    return any(event.timestamp <= t <= event.completed for t in model_starts)
+
+
+def _sandbox_action(
+    event: SandboxEvent, index: int, policy: Untranscribed, model_starts: Sequence[datetime]
+) -> RecordedCall | None:
+    if event.action == "read_file" or policy == "ignore":
+        return None
+    what = f"{event.action} {event.cmd or event.file}"
+    content = event.input or ""
+    disposition: Disposition = "replay"
+    reason = ""
+    if policy == "inconclusive":
+        disposition = "unreproducible"
+        reason = (
+            f"sandbox action outside any tool call ({what}); pass untranscribed='replay' "
+            "to re-issue such actions or 'ignore' to leave them out"
+        )
+    elif event.pending:
+        disposition, reason = "unreproducible", f"{what} never completed"
+    elif _overlaps_model(event, model_starts):
+        disposition = "unreproducible"
+        reason = (
+            f"a model call ran during {what}: an agent in the sandbox, not a replayable command"
+        )
+    elif _TRUNCATED in content or (event.action == "write_file" and content.startswith(_BINARY)):
+        disposition, reason = "unreproducible", f"the transcript kept only part of {what}'s input"
+    options = dict(event.options or {})
+    arguments: dict[str, Any] = (
+        {"cmd": event.cmd, "input": event.input, **options}
+        if event.action == "exec"
+        else {"file": event.file, "contents": event.input}
+    )
+    return RecordedCall(
+        id=f"sandbox-{index}",
+        function=f"sandbox.{event.action}",
+        arguments=arguments,
+        result=event.output or "",
+        error=None,
+        disposition=disposition,
+        reason=reason,
+        kind=event.action,
+        returncode=event.result,
+    )
 
 
 def calls_from_events(
-    events: Iterable[Any], *, skip_tools: Iterable[str] = DEFAULT_SKIP_TOOLS
+    events: Iterable[object],
+    *,
+    skip_tools: Iterable[str] = DEFAULT_SKIP_TOOLS,
+    untranscribed: Untranscribed = "inconclusive",
 ) -> list[RecordedCall]:
-    """Recorded calls, in execution order, from a sample's transcript events."""
+    """Recorded actions, in transcript order, from a sample's events."""
+    events = list(events)
+    spans = _Spans(events)
     skip = frozenset(skip_tools)
+    model_starts = [e.timestamp for e in events if isinstance(e, ModelEvent)]
     calls: list[RecordedCall] = []
-    for event in _outside_agent_spans(list(events)):
-        handoff = bool(event.agent or event.agent_span_id)
-        incomplete = bool(event.pending) or bool(event.failed)
-        disposition, reason = _classify(
-            event.function, event.error, skip_tools=skip, handoff=handoff, incomplete=incomplete
-        )
-        if event.failed and not handoff:
-            reason = "the original call failed with a hard error"
-        calls.append(
-            RecordedCall(
-                id=event.id,
-                function=event.function,
-                arguments=dict(event.arguments),
-                result=result_text(event.result),
-                error=event.error,
-                disposition=disposition,
-                reason=reason,
-                nondeterministic=event.error is not None and event.error.type == "timeout",
-            )
-        )
+    for index, event in enumerate(events):
+        if isinstance(event, ToolEvent) and spans.outside_scoring(event.span_id):
+            calls.append(_tool_call(event, skip))
+        elif isinstance(event, SandboxEvent) and spans.untranscribed(event.span_id):
+            action = _sandbox_action(event, index, untranscribed, model_starts)
+            if action is not None:
+                calls.append(action)
     return calls
 
 
@@ -170,11 +247,7 @@ def calls_from_messages(
             if call.parse_error and error is None:
                 error = ToolCallError("parsing", call.parse_error)
             disposition, reason = _classify(
-                call.function,
-                error,
-                skip_tools=skip,
-                handoff=False,
-                incomplete=reply is None,
+                call.function, error, skip_tools=skip, handoff=False, incomplete=reply is None
             )
             calls.append(
                 RecordedCall(
@@ -193,12 +266,14 @@ def calls_from_messages(
 
 def recorded_calls(
     *,
-    events: Iterable[Any] | None = None,
+    events: Iterable[object] | None = None,
     messages: Sequence[ChatMessage] | None = None,
     skip_tools: Iterable[str] = DEFAULT_SKIP_TOOLS,
+    untranscribed: Untranscribed = "inconclusive",
 ) -> tuple[list[RecordedCall], Literal["events", "messages"]]:
-    """The calls to replay, preferring tool events and falling back to messages."""
-    from_events = calls_from_events(events or [], skip_tools=skip_tools)
-    if from_events:
-        return from_events, "events"
+    """The actions to replay, preferring events and falling back to messages."""
+    events = list(events or [])
+    if any(isinstance(e, ToolEvent | SandboxEvent) for e in events):
+        calls = calls_from_events(events, skip_tools=skip_tools, untranscribed=untranscribed)
+        return calls, "events"
     return calls_from_messages(messages or [], skip_tools=skip_tools), "messages"

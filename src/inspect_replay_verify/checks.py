@@ -13,8 +13,6 @@ Checks come in two phases, run in this order:
   to the evidence while it is read; see `ReplayAdapter.collect`.
 """
 
-from __future__ import annotations
-
 import hashlib
 import re
 from abc import ABC, abstractmethod
@@ -27,7 +25,7 @@ from inspect_ai.util import SandboxEnvironment
 Phase = Literal["live", "evidence"]
 
 
-@dataclass(frozen=True)
+@dataclass(frozen=True, kw_only=True, slots=True)
 class CheckOutcome:
     """What one check observed in the replay sandbox."""
 
@@ -106,7 +104,9 @@ class _CommandCheck(LiveCheck):
         try:
             result = await env.exec(self.cmd, user=self.user, cwd=self.cwd, timeout=self.timeout)
         except TimeoutError:
-            return CheckOutcome(self.name, None, f"timed out after {self.timeout}s")
+            return CheckOutcome(
+                name=self.name, passed=None, explanation=f"timed out after {self.timeout}s"
+            )
         observed = {
             "returncode": result.returncode,
             "stdout": result.stdout[-2000:],
@@ -114,10 +114,10 @@ class _CommandCheck(LiveCheck):
         }
         passed = result.returncode == self.expected_exit
         return CheckOutcome(
-            self.name,
-            passed,
-            f"exit {result.returncode}, expected {self.expected_exit}",
-            observed,
+            name=self.name,
+            passed=passed,
+            explanation=f"exit {result.returncode}, expected {self.expected_exit}",
+            observed=observed,
         )
 
 
@@ -192,13 +192,15 @@ class _FileHash(_FileCheck):
 
     def judge(self, data: bytes | None) -> CheckOutcome:
         if data is None:
-            return CheckOutcome(self.name, False, f"{self.path} does not exist")
+            return CheckOutcome(
+                name=self.name, passed=False, explanation=f"{self.path} does not exist"
+            )
         digest = hashlib.sha256(data).hexdigest()
         return CheckOutcome(
-            self.name,
-            digest == self.expected,
-            f"sha256 {digest}, expected {self.expected}",
-            {"sha256": digest, "size": len(data)},
+            name=self.name,
+            passed=digest == self.expected,
+            explanation=f"sha256 {digest}, expected {self.expected}",
+            observed={"sha256": digest, "size": len(data)},
         )
 
 
@@ -210,10 +212,10 @@ class _FileExists(_FileCheck):
     def judge(self, data: bytes | None) -> CheckOutcome:
         present = data is not None
         return CheckOutcome(
-            self.name,
-            present == self.exists,
-            f"{self.path} {'exists' if present else 'is absent'}",
-            {"exists": present},
+            name=self.name,
+            passed=present == self.exists,
+            explanation=f"{self.path} {'exists' if present else 'is absent'}",
+            observed={"exists": present},
         )
 
 
@@ -227,11 +229,15 @@ class _FileContains(_FileCheck):
 
     def judge(self, data: bytes | None) -> CheckOutcome:
         if data is None:
-            return CheckOutcome(self.name, False, f"{self.path} does not exist")
+            return CheckOutcome(
+                name=self.name, passed=False, explanation=f"{self.path} does not exist"
+            )
         text = data.decode("utf-8", errors="replace")
         found = re.search(self.pattern, text) is not None if self.regex else self.pattern in text
         return CheckOutcome(
-            self.name, found, f"{'found' if found else 'did not find'} {self.pattern!r}"
+            name=self.name,
+            passed=found,
+            explanation=f"{'found' if found else 'did not find'} {self.pattern!r}",
         )
 
 
@@ -276,7 +282,7 @@ class _FunctionCheck(Check):
         result = await self.fn(target)
         if isinstance(result, CheckOutcome):
             return result
-        return CheckOutcome(self.name, bool(result))
+        return CheckOutcome(name=self.name, passed=bool(result))
 
 
 def custom_check(

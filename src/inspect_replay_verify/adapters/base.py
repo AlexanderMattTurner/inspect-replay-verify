@@ -6,8 +6,6 @@ freezing the guest before evidence is read, masking session-scoped values — su
 `ReplayAdapter` and registers under the ``inspect_replay_verify`` entry-point group.
 """
 
-from __future__ import annotations
-
 import re
 from collections.abc import Mapping, Sequence
 from dataclasses import dataclass, field, replace
@@ -36,7 +34,7 @@ DEFAULT_CREDENTIAL_PATTERNS: Mapping[str, str] = {
 }
 
 
-@dataclass
+@dataclass(kw_only=True, slots=True)
 class Collected:
     """The checks' outcomes, or why the adapter could not collect them trustworthily."""
 
@@ -71,7 +69,9 @@ async def run_check(check: Check, target: Any) -> CheckOutcome:
     try:
         return await check.run(target)
     except Exception as ex:
-        return CheckOutcome(check.name, None, f"check raised {type(ex).__name__}: {ex}")
+        return CheckOutcome(
+            name=check.name, passed=None, explanation=f"check raised {type(ex).__name__}: {ex}"
+        )
 
 
 class ReplayAdapter:

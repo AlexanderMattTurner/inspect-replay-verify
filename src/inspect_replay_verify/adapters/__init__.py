@@ -1,7 +1,6 @@
 """Backend adapters, chosen by the replay sandbox's type name."""
 
-from __future__ import annotations
-
+import logging
 from importlib.metadata import entry_points
 
 from .base import (
@@ -13,6 +12,7 @@ from .base import (
 from .glovebox import GloveboxAdapter
 
 ENTRY_POINT_GROUP = "inspect_replay_verify"
+logger = logging.getLogger(__name__)
 
 __all__ = [
     "DEFAULT_CREDENTIAL_PATTERNS",
@@ -30,7 +30,8 @@ def _registered() -> list[type[ReplayAdapter]]:
     for ep in entry_points(group=ENTRY_POINT_GROUP):
         try:
             cls = ep.load()
-        except Exception:
+        except Exception as ex:
+            logger.warning("replay adapter entry point %r failed to load: %r", ep.name, ex)
             continue
         if isinstance(cls, type) and issubclass(cls, ReplayAdapter) and cls not in found:
             found.append(cls)

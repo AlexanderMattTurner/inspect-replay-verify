@@ -8,8 +8,6 @@ if a release moves one. Nothing else in the package imports from `inspect_ai._*`
 `inspect_ai.*._*`.
 """
 
-from __future__ import annotations
-
 import importlib
 from collections.abc import Iterator
 from contextlib import contextmanager

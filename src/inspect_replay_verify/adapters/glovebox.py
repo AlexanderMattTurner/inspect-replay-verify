@@ -31,8 +31,6 @@ Two things differ from a plain container:
    counted. Pass `remint=` to substitute a fresh value into such calls instead.
 """
 
-from __future__ import annotations
-
 import asyncio
 import re
 from collections.abc import Callable, Mapping, Sequence
@@ -62,7 +60,7 @@ class EvidenceUnavailable(RuntimeError):
 class GloveboxEvidenceReader:
     """Reads files as guest root through the run's trusted collector, after quiescence."""
 
-    def __init__(self, adapter: GloveboxAdapter, environments: Mapping[str, SandboxEnvironment]):
+    def __init__(self, adapter: "GloveboxAdapter", environments: Mapping[str, SandboxEnvironment]):
         self._adapter = adapter
         self._live = _Live(environments)
 

@@ -65,6 +65,11 @@ Any of these makes the verdict inconclusive:
 - A recorded call had an unknown effect: it was cancelled mid-flight, its sandbox became
   unavailable, it never completed, or it failed with a hard error. The replay stops there.
 - A recorded tool is not available to the replay.
+- A replayed call ends with a different outcome than the original did. Examples are a
+  tool error the original did not raise, or an `exec` with another exit status. Whatever
+  the replay then leaves behind cannot stand for the original.
+- The sandbox was changed outside any tool call, and `untranscribed` is left at its
+  default. See [Sandbox actions outside tool calls](#sandbox-actions-outside-tool-calls).
 - A check raised or timed out, and no other check definitely failed.
 - The adapter cannot trust the evidence. For glovebox, this means the guest was not
   confirmed quiescent.
@@ -105,15 +110,37 @@ Tools are resolved in this order:
 If the agent's tools were configured and are not on `state.tools`, as with
 `react(tools=[bash(timeout=180)])`, pass them with `tools=`.
 
+### Sandbox actions outside tool calls
+
+A solver can change the sandbox without a tool call, through `sandbox().exec(...)` or
+`write_file`. Harness setup does this, as in SWE-style tasks, and so does an agent that
+runs inside the sandbox through the agent bridge. Inspect records each such action as a
+`SandboxEvent`. A replay of the tool calls alone would start from a different state, so
+`untranscribed=` decides what happens:
+
+| `untranscribed`            | effect                                                                    |
+| -------------------------- | ------------------------------------------------------------------------- |
+| `"inconclusive"` (default) | refuse to judge, and name the action                                      |
+| `"replay"`                 | re-issue each `exec` and `write_file` in transcript order, beside the tool calls |
+| `"ignore"`                 | leave them out, so their effect counts against the agent                  |
+
+Even with `"replay"`, some actions are unreproducible. These are an action whose
+recorded input Inspect truncated (more than 20 lines, or binary content), an action that
+never completed, and a command during which a model call ran. That last case is an agent
+working inside the sandbox, so its effects are not a fixed command. Sandbox actions made
+by a tool's own body, by Inspect's sample setup, or by scorers are never counted.
+
 ### Divergence
 
-A replayed call's output is compared with the recorded output. Before comparing, the
+A replayed tool call's output is compared with the recorded output. Before comparing, the
 adapter masks session-scoped values: credentials matching known token formats, and
 session identifiers such as VM names. A mismatch is a *divergence*. By default
 (`on_divergence="record"`), divergences are counted in the metadata and the verdict comes
 from the checks alone. Timestamps, PIDs and temporary names diverge in honest runs too.
-For a deterministic task, set `on_divergence="inconclusive"` to refuse to judge any
-replay whose observed outputs don't match the transcript.
+Inspect's `bash` and `python` tools report a non-zero exit as plain output, not as an
+error, so a command that fails only on replay shows up as a divergence. For a
+deterministic task, set `on_divergence="inconclusive"` to refuse to judge any replay
+whose observed outputs don't match the transcript.
 
 ## Checks
 
@@ -237,9 +264,16 @@ mybackend = "my_package.replay:MyBackendAdapter"
 
 ```
 uv venv && uv pip install -e ".[dev]"
-pytest            # end-to-end evals on Inspect's local sandbox, plus adapter unit tests
+pytest                    # real evals on Inspect's local sandbox, and unit tests
+pytest -m docker          # real evals in Docker containers (needs a Docker daemon)
+pytest -m glovebox        # real glovebox microVMs (needs KVM and a provisioned host)
+python tools/mutate.py    # break each decision the verdict rests on; a test must go red
 ruff check . && ruff format --check . && mypy
 ```
+
+CI runs each of these as its own job. The `e2e-glovebox` job provisions an
+`ubuntu-latest` runner as a glovebox host, using agent-glovebox's own setup at a pinned
+commit, and then runs `pytest -m glovebox` against real microVMs.
 
 ## License
 
