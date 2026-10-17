@@ -9,7 +9,7 @@ permissions:
   contents: read
 
 concurrency:
-  group: ci-${{ github.ref }}
+  group: ci-${{ github.head_ref || github.ref_name }}
   cancel-in-progress: true
 
 jobs:
@@ -60,7 +60,13 @@ jobs:
           persist-credentials: false
       - uses: astral-sh/setup-uv@c771a70e6277c0a99b617c7a806ffedaca235ff9 # v9.0.0
       - run: uv venv -p 3.13 && uv pip install -e ".[dev]"
-      - run: docker compose -f tests/e2e/compose.yaml pull
+      - name: Pull the e2e image (retried; registries rate-limit shared runner IPs)
+        run: |
+          for attempt in 1 2 3; do
+            docker compose -f tests/e2e/compose.yaml pull && exit 0
+            sleep $((attempt * 20))
+          done
+          exit 1
       - run: uv run --no-sync pytest -m docker -v
 
   mutation:

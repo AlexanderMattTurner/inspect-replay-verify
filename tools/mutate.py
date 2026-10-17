@@ -43,14 +43,14 @@ MUTANTS = [
     ),
     Mutant(
         file="transcript.py",
-        old='return not self._types(span_id) & {"scorer", "scorers", REPLAY_SPAN_TYPE}',
-        new='return not self._types(span_id) & {"scorer", "scorers"}',
+        old='_SCORING = frozenset({"scorer", REPLAY_SPAN_TYPE})',
+        new='_SCORING = frozenset({"scorer"})',
         breaks="a replay's own calls are read as the agent's",
     ),
     Mutant(
         file="transcript.py",
-        old='{"scorer", "scorers", REPLAY_SPAN_TYPE, "tool", "init"}',
-        new='{"scorer", "scorers", REPLAY_SPAN_TYPE, "init"}',
+        old='        if nearest != "tool":\n            return True',
+        new='        if True:\n            return True',
         breaks="a tool's own sandbox calls are counted as untranscribed",
     ),
     Mutant(
@@ -70,6 +70,24 @@ MUTANTS = [
         old="elif _TRUNCATED in content or",
         new="elif False and _TRUNCATED in content or",
         breaks="a truncated recorded input is re-issued",
+    ),
+    Mutant(
+        file="transcript.py",
+        old='return index + 1 < len(chain) and chain[index + 1].type == "handoff"',
+        new="return False",
+        breaks="a handoff agent's own sandbox calls are dropped as a tool body",
+    ),
+    Mutant(
+        file="transcript.py",
+        old="or len(content) >= _RECORDED_CHARS:",
+        new=":",
+        breaks="input Inspect cut at 10,000 characters is re-issued as if whole",
+    ),
+    Mutant(
+        file="transcript.py",
+        old='    if calls:\n        return calls, "events"',
+        new='    if True:\n        return calls, "events"',
+        breaks="init-only events hide the message fallback",
     ),
     Mutant(
         file="replay.py",
