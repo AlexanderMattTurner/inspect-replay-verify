@@ -1,54 +1,59 @@
 """Verifying a finished `.eval` log after the fact."""
 
-from __future__ import annotations
-
-from helpers import run, sha256
+from helpers import exec_setup, file_is, run, sha256, write_out_of_band
 from inspect_ai.dataset import Sample
-from inspect_ai.scorer import CORRECT, Score, Target, scorer
-from inspect_ai.solver import TaskState
-from test_scorer import out_of_band_write
 
-from inspect_replay_verify import file_contains, file_hash, replay_log
+import inspect_replay_verify as irv
 
-
-@scorer(metrics=[])
-def always_pass():
-    async def score(state: TaskState, target: Target) -> Score:
-        return Score(value=CORRECT)
-
-    return score
+HELLO = [irv.file_hash("out.txt", sha256("hello"))]
 
 
 def test_replay_a_finished_log() -> None:
-    log = run(["printf hello > out.txt"], always_pass())
-    [report] = replay_log(log.location, [file_hash("out.txt", sha256("hello"))]).values()
+    log = run(["printf hello > out.txt"], file_is("out.txt", "hello"))
+    [report] = irv.replay_log(log.location, HELLO).values()
+    assert (report.verdict, report.transcript_source) == ("verified", "events"), report.explanation
+
+
+def test_an_out_of_band_effect_in_a_finished_log() -> None:
+    log = run(
+        ["cat out.txt"], file_is("out.txt", "hello"), before=[write_out_of_band("out.txt", "hello")]
+    )
+    verdicts = {
+        policy: next(iter(irv.replay_log(log, HELLO, untranscribed=policy).values())).verdict
+        for policy in ("inconclusive", "ignore", "replay")
+    }
+    assert verdicts == {"inconclusive": "inconclusive", "ignore": "refuted", "replay": "verified"}
+
+
+def test_harness_setup_in_a_finished_log() -> None:
+    log = run(
+        ["printf ' agent' >> repo.txt"],
+        file_is("repo.txt", "base agent"),
+        before=[exec_setup("printf base > repo.txt")],
+    )
+    checks = [irv.file_contains("repo.txt", "base agent")]
+    [report] = irv.replay_log(log, checks, untranscribed="replay").values()
     assert report.verdict == "verified", report.explanation
-    assert report.transcript_source == "events"
-
-
-def test_replay_a_finished_log_refutes_an_out_of_band_effect() -> None:
-    log = run(["cat out.txt"], always_pass(), before=[out_of_band_write()])
-    [report] = replay_log(log, [file_hash("out.txt", sha256("hello"))]).values()
-    assert report.verdict == "refuted"
 
 
 def test_sample_files_need_the_dataset() -> None:
     sample = Sample(id="s1", input="x", target="done", files={"seed.txt": "seed"})
-    log = run(["cp seed.txt out.txt"], always_pass(), sample=sample)
-    checks = [file_contains("out.txt", "seed")]
+    log = run(["cp seed.txt out.txt"], file_is("out.txt", "seed"), sample=sample)
+    checks = [irv.file_contains("out.txt", "seed")]
 
-    [report] = replay_log(log, checks).values()
+    [report] = irv.replay_log(log, checks).values()
     assert report.verdict == "inconclusive"
     assert "dataset" in report.explanation
 
-    [report] = replay_log(log, checks, dataset=[sample]).values()
+    [report] = irv.replay_log(log, checks, dataset=[sample]).values()
     assert report.verdict == "verified", report.explanation
 
 
 def test_replay_falls_back_to_messages_without_events() -> None:
-    log = run(["printf hello > out.txt"], always_pass())
+    log = run(["printf hello > out.txt"], file_is("out.txt", "hello"))
     assert log.samples
     log.samples[0].events = []
-    [report] = replay_log(log, [file_hash("out.txt", sha256("hello"))]).values()
-    assert report.transcript_source == "messages"
-    assert report.verdict == "verified", report.explanation
+    [report] = irv.replay_log(log, HELLO).values()
+    assert (report.verdict, report.transcript_source) == ("verified", "messages"), (
+        report.explanation
+    )

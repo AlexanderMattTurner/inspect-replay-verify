@@ -42,6 +42,13 @@ packages = ["src/inspect_replay_verify"]
 [tool.pytest.ini_options]
 asyncio_mode = "auto"
 testpaths = ["tests"]
+xfail_strict = true
+# The e2e suites need a container runtime or KVM; CI runs each in its own job with `-m`.
+addopts = "-m 'not docker and not glovebox'"
+markers = [
+    "docker: drives Inspect's real docker sandbox (needs a Docker daemon)",
+    "glovebox: drives a real glovebox microVM (needs KVM and a provisioned glovebox host)",
+]
 
 [tool.ruff]
 line-length = 100

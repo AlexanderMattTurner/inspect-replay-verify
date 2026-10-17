@@ -4,8 +4,6 @@ The real provider needs KVM; what is under test here is the adapter's ordering a
 refusals, which the fake makes observable.
 """
 
-from __future__ import annotations
-
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any, ClassVar

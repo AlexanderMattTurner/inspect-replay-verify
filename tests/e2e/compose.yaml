@@ -1,0 +1,9 @@
+# The image is served from ECR's mirror of Docker Hub's official images: Docker Hub
+# rate-limits anonymous pulls by IP, which shared CI runners exhaust.
+services:
+  default:
+    image: public.ecr.aws/docker/library/python:3.12-slim
+    init: true
+    command: tail -f /dev/null
+    working_dir: /work
+    network_mode: none
