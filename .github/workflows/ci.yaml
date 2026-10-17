@@ -2,18 +2,25 @@ name: CI
 
 on:
   push:
-    branches: [main]
   pull_request:
+  workflow_dispatch:
 
 permissions:
   contents: read
 
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: true
+
 jobs:
   lint:
     runs-on: ubuntu-latest
+    timeout-minutes: 10
     steps:
-      - uses: actions/checkout@v4
-      - uses: astral-sh/setup-uv@v5
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - uses: astral-sh/setup-uv@c771a70e6277c0a99b617c7a806ffedaca235ff9 # v9.0.0
       - run: uv venv -p 3.13 && uv pip install -e ".[dev]"
       - run: uv run --no-sync ruff check .
       - run: uv run --no-sync ruff format --check .
@@ -21,16 +28,93 @@ jobs:
 
   test:
     runs-on: ubuntu-latest
+    timeout-minutes: 15
     strategy:
       fail-fast: false
       matrix:
         include:
           - python: "3.11"
-            inspect: "inspect-ai==0.3.245"   # the declared floor
+            inspect: "inspect-ai==0.3.245" # the declared floor
           - python: "3.13"
-            inspect: "inspect-ai"            # latest
+            inspect: "inspect-ai" # latest
     steps:
-      - uses: actions/checkout@v4
-      - uses: astral-sh/setup-uv@v5
-      - run: uv venv -p ${{ matrix.python }} && uv pip install -e ".[dev]" "${{ matrix.inspect }}"
-      - run: uv run --no-sync pytest -q
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - uses: astral-sh/setup-uv@c771a70e6277c0a99b617c7a806ffedaca235ff9 # v9.0.0
+      # glovebox-driver is installed so the adapter's driver-seam test runs, not skips.
+      - run: >-
+          uv venv -p ${{ matrix.python }} &&
+          uv pip install -e ".[dev]" "${{ matrix.inspect }}"
+          "glovebox-driver @ git+https://github.com/AlexanderMattTurner/agent-glovebox@${GLOVEBOX_SHA}#subdirectory=glovebox-driver"
+        env:
+          GLOVEBOX_SHA: 284d5a988d7f9295abcd44444dcb780ee4efe431
+      - run: uv run --no-sync pytest -q -rs
+
+  e2e-docker:
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - uses: astral-sh/setup-uv@c771a70e6277c0a99b617c7a806ffedaca235ff9 # v9.0.0
+      - run: uv venv -p 3.13 && uv pip install -e ".[dev]"
+      - run: docker compose -f tests/e2e/compose.yaml pull
+      - run: uv run --no-sync pytest -m docker -v
+
+  mutation:
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - uses: astral-sh/setup-uv@c771a70e6277c0a99b617c7a806ffedaca235ff9 # v9.0.0
+      - run: uv venv -p 3.13 && uv pip install -e ".[dev]"
+      - run: uv run --no-sync python tools/mutate.py
+
+  # A real microVM through the `glovebox` Inspect provider. The host is provisioned by
+  # agent-glovebox's own runner setup, checked out at the pinned commit as the workspace
+  # root so its composite actions resolve; this repository sits beside it.
+  e2e-glovebox:
+    runs-on: ubuntu-latest
+    timeout-minutes: 70
+    env:
+      GLOVEBOX_SHA: 284d5a988d7f9295abcd44444dcb780ee4efe431
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          repository: AlexanderMattTurner/agent-glovebox
+          ref: ${{ env.GLOVEBOX_SHA }}
+          persist-credentials: false
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          path: inspect-replay-verify
+          persist-credentials: false
+      - run: bash .github/scripts/vm-live/free-runner-disk.sh
+      - run: bash .github/scripts/vm-live/require-kvm.sh
+      - uses: ./.github/actions/setup-node-for-vm
+      - run: bash .github/scripts/vm-live/runner-setup.sh
+      - uses: ./.github/actions/provision-kata
+      - uses: ./.github/actions/setup-base-env
+        with:
+          setup-python: "true"
+          setup-node: "false"
+      - run: bash .github/scripts/uv-sync-retry.sh --extra dev
+      - uses: ./.github/actions/install-cosign
+      - run: uv pip install --python .venv/bin/python -e ./inspect-replay-verify pytest-asyncio
+      - name: Replay against a real glovebox microVM
+        working-directory: inspect-replay-verify
+        run: ../.venv/bin/python -m pytest -m glovebox -v --basetemp "$RUNNER_TEMP/irv"
+      - name: Keep the eval logs
+        if: always()
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: glovebox-e2e-logs
+          path: ${{ runner.temp }}/irv
+          if-no-files-found: ignore
+          retention-days: 7
+      - name: Dump sandbox runtime diagnostics
+        if: failure()
+        run: bash .github/scripts/vm-live/diagnose.sh
