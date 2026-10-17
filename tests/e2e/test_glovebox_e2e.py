@@ -5,7 +5,7 @@ agent-glovebox's own runner setup, at the commit that job pins.
 """
 
 import pytest
-from helpers import file_is, replay_meta, run, sha256, value
+from helpers import TICKER, file_is, read_ticks_twice, replay_meta, run, sha256, value
 from inspect_ai.scorer import CORRECT
 
 import inspect_replay_verify as irv
@@ -27,18 +27,19 @@ def test_honest_run_is_verified_from_a_quiescent_guest() -> None:
     assert (quiescence["established"], quiescence["survivors"]) == (True, [])
 
 
-def test_a_delayed_writer_the_replay_starts_is_stopped_before_evidence_is_read() -> None:
-    """The writer would forge out.txt long after the replay ends; quiescence kills it first."""
-    forge_later = "nohup sh -c 'sleep 120; printf forged > out.txt' >/dev/null 2>&1 &"
+def test_a_writer_the_replay_left_running_cannot_move_the_evidence() -> None:
+    """A loop appends every 0.1s; read after quiescence, the file holds still."""
     log = run(
-        ["printf hello > out.txt", forge_later],
-        irv.replay_scorer([irv.file_hash("out.txt", sha256("hello"))]),
+        [TICKER, "sleep 1"],
+        irv.replay_scorer([irv.custom_check(read_ticks_twice, phase="evidence")]),
         sandbox="glovebox",
     )
     meta = replay_meta(log)
     assert meta["verdict"] == "verified", meta["explanation"]
     [quiescence] = meta["notes"]["quiescence"]
-    assert quiescence["established"] is True, quiescence["why"]
+    assert (quiescence["established"], quiescence["survivors"]) == (True, [])
+    [check] = meta["checks"]
+    assert check["observed"]["bytes"][0] > 0
 
 
 def test_root_owned_evidence_is_read_after_quiescence() -> None:
@@ -51,9 +52,10 @@ def test_root_owned_evidence_is_read_after_quiescence() -> None:
 
 
 def test_the_original_microvm_is_untouched_by_the_replay() -> None:
+    overwrite = irv.command_succeeds("true", restore_files={"out.txt": "replay"})
     log = run(
         ["printf orig > out.txt"],
-        [irv.replay_scorer([irv.file_exists("out.txt")]), file_is("out.txt", "orig")],
+        [irv.replay_scorer([overwrite]), file_is("out.txt", "orig")],
         sandbox="glovebox",
     )
     assert value(log, "file_is") == CORRECT

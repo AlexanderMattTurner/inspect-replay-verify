@@ -3,7 +3,17 @@
 from pathlib import Path
 
 import pytest
-from helpers import exec_setup, file_is, replay_meta, run, sha256, value, write_out_of_band
+from helpers import (
+    TICKER,
+    exec_setup,
+    file_is,
+    read_ticks_twice,
+    replay_meta,
+    run,
+    sha256,
+    value,
+    write_out_of_band,
+)
 from inspect_ai.dataset import Sample
 from inspect_ai.scorer import CORRECT, INCORRECT
 
@@ -53,14 +63,25 @@ def test_a_file_only_the_original_container_holds_is_absent_from_the_replay() ->
     """The replay boots its own container: what the agent's container held does not leak in."""
     log = run(
         ["true"],
-        [file_is("leak.txt", "x"), irv.replay_scorer([irv.file_exists("leak.txt", exists=False)])],
+        [
+            file_is("leak.txt", "x"),
+            irv.replay_scorer([irv.file_exists("leak.txt", exists=False)], untranscribed="ignore"),
+        ],
         before=[exec_setup("printf x > leak.txt")],
         sandbox=DOCKER,
     )
     assert value(log, "file_is") == CORRECT
-    meta = replay_meta(log)
-    assert meta["verdict"] == "inconclusive"
-    assert "exec bash -c 'printf x > leak.txt'" in meta["explanation"]
+    assert replay_meta(log)["verdict"] == "verified", replay_meta(log)["explanation"]
+
+
+def test_the_original_container_is_untouched_by_the_replay() -> None:
+    overwrite = irv.command_succeeds("true", restore_files={"out.txt": "replay"})
+    log = run(
+        ["printf orig > out.txt"],
+        [irv.replay_scorer([overwrite]), file_is("out.txt", "orig")],
+        sandbox=DOCKER,
+    )
+    assert value(log, "file_is") == CORRECT
 
 
 def test_rewritten_tests_are_caught_by_restoring_them() -> None:
@@ -77,3 +98,17 @@ def test_replay_a_finished_docker_log() -> None:
     log = run(["printf hello > out.txt"], file_is("out.txt", "hello"), sandbox=DOCKER)
     [report] = irv.replay_log(log, [irv.file_hash("out.txt", sha256("hello"))]).values()
     assert (report.verdict, report.sandbox_type) == ("verified", "docker"), report.explanation
+
+
+def test_a_running_writer_moves_unfrozen_evidence() -> None:
+    """Docker's default adapter does not freeze the container, so the evidence moves under it."""
+    log = run(
+        [TICKER, "sleep 1"],
+        irv.replay_scorer([irv.custom_check(read_ticks_twice, phase="evidence")]),
+        sandbox=DOCKER,
+    )
+    meta = replay_meta(log)
+    assert meta["verdict"] == "refuted", meta["explanation"]
+    [check] = meta["checks"]
+    first, second = check["observed"]["bytes"]
+    assert 0 < first < second

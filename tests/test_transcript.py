@@ -7,11 +7,13 @@ from inspect_ai.event import ModelEvent, SandboxEvent, SpanBeginEvent, ToolEvent
 from inspect_ai.model import ChatMessageAssistant, ChatMessageTool, GenerateConfig, ModelOutput
 from inspect_ai.tool import ToolCall, ToolCallError
 
+from inspect_replay_verify import replay_scorer
 from inspect_replay_verify.transcript import (
     ERROR_DISPOSITIONS,
     ERROR_TYPES,
     calls_from_events,
     calls_from_messages,
+    recorded_calls,
 )
 
 T0 = datetime(2026, 1, 1, tzinfo=UTC)
@@ -119,8 +121,10 @@ def test_only_sandbox_actions_outside_tools_and_init_are_untranscribed() -> None
     [
         sandbox_event("exec", cmd="cat", input="a\n\nOutput truncated (30 additional lines)"),
         sandbox_event("write_file", file="blob", input="binary (2.00 KB)"),
-        sandbox_event("exec", cmd="sleep 60", pending=True),
+        sandbox_event("exec", cmd="cat", input="binary (3 B)"),
+        sandbox_event("write_file", file="long", input="x" * 10_000),
     ],
+    ids=["truncated-lines", "binary-write", "binary-stdin", "cut-at-10k-chars"],
 )
 def test_sandbox_actions_the_transcript_cannot_reproduce(event: SandboxEvent) -> None:
     [call] = calls_from_events([event], untranscribed="replay")
@@ -159,3 +163,56 @@ def test_messages_fallback_marks_unanswered_calls_unreproducible() -> None:
         ("a", "replay", "ok"),
         ("b", "unreproducible", ""),
     ]
+
+
+def span(id: str, type: str, parent: str | None = None, name: str = "s") -> SpanBeginEvent:
+    return SpanBeginEvent(id=id, name=name, type=type, parent_id=parent)
+
+
+@pytest.mark.parametrize(
+    ("spans", "untranscribed"),
+    [
+        ([span("t", "tool")], False),
+        ([span("a", "agent"), span("t", "tool", "a")], False),
+        ([span("h", "handoff"), span("t", "tool", "h")], True),
+        ([span("t", "tool"), span("a", "agent", "t")], True),
+        ([span("x", "solver", name="init")], True),
+        ([span("x", "solver", name="tool")], True),
+    ],
+    ids=[
+        "tool-body",
+        "tool-in-agent",
+        "handoff-agent",
+        "as-tool-agent",
+        "named-init",
+        "named-tool",
+    ],
+)
+def test_which_span_owns_a_sandbox_action(spans: list[SpanBeginEvent], untranscribed: bool) -> None:
+    events = [*spans, sandbox_event("exec", cmd="make", span_id=spans[-1].id)]
+    assert len(calls_from_events(events, untranscribed="replay")) == int(untranscribed)
+
+
+def test_init_sandbox_events_do_not_hide_the_message_fallback() -> None:
+    events = [span("i", "init"), sandbox_event("write_file", file="seed", input="s", span_id="i")]
+    messages = [
+        ChatMessageAssistant(
+            content="", tool_calls=[ToolCall(id="a", function="bash", arguments={"cmd": "ls"})]
+        ),
+        ChatMessageTool(content="ok", tool_call_id="a", function="bash"),
+    ]
+    calls, source = recorded_calls(events=events, messages=messages)
+    assert ([c.id for c in calls], source) == (["a"], "messages")
+
+
+@pytest.mark.parametrize("policy", ["skip", "Replay", ""])
+def test_an_unknown_untranscribed_policy_is_refused(policy: str) -> None:
+    with pytest.raises(ValueError, match="untranscribed is one of"):
+        calls_from_events([], untranscribed=policy)  # type: ignore[arg-type]
+    with pytest.raises(ValueError, match="untranscribed is one of"):
+        replay_scorer([], untranscribed=policy)  # type: ignore[arg-type]
+
+
+def test_the_store_backed_memory_tool_is_not_replayed() -> None:
+    [call] = calls_from_events([tool_event("m", function="memory")])
+    assert call.disposition == "skip"

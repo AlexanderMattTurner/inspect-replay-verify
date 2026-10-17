@@ -15,6 +15,8 @@ from inspect_ai.solver import Generate, Solver, TaskState, generate, solver, use
 from inspect_ai.tool import Tool, ToolCall, ToolCallView, ToolDef, ToolError, bash, tool
 from inspect_ai.util import SandboxEnvironmentType, sandbox
 
+from inspect_replay_verify import CheckOutcome, EvidenceReader
+
 MODEL = "mockllm/model"
 # The bash tool's argument was renamed across Inspect releases (`cmd` -> `command`).
 BASH_ARG = next(iter(ToolDef(bash()).parameters.properties))
@@ -148,3 +150,17 @@ def reject_marked() -> Approver:
         return Approval(decision="reject" if rejected else "approve")
 
     return approve
+
+
+# A writer the replay leaves running: it appends to ticks.txt every 0.1s until stopped.
+TICKER = "nohup sh -c 'while :; do echo t >> ticks.txt; sleep 0.1; done' >/dev/null 2>&1 &"
+
+
+async def read_ticks_twice(reader: EvidenceReader) -> CheckOutcome:
+    """Passes only when ticks.txt holds still across two reads two seconds apart."""
+    first = await reader.read_file("ticks.txt")
+    await anyio.sleep(2)
+    second = await reader.read_file("ticks.txt")
+    return CheckOutcome(
+        name="ticks stable", passed=first == second, observed={"bytes": [len(first), len(second)]}
+    )

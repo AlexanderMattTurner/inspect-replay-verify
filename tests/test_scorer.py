@@ -19,9 +19,7 @@ from helpers import (
 from inspect_ai.approval import ApprovalPolicy
 from inspect_ai.dataset import Sample
 from inspect_ai.model import ModelOutput
-from inspect_ai.scorer import CORRECT, INCORRECT, NOANSWER, Score, Target, scorer
-from inspect_ai.solver import TaskState
-from inspect_ai.util import sandbox
+from inspect_ai.scorer import CORRECT, INCORRECT, NOANSWER
 
 import inspect_replay_verify as irv
 
@@ -227,16 +225,8 @@ def test_replay_scorers_do_not_see_each_others_calls() -> None:
 
 
 def test_original_sandbox_is_untouched_by_the_replay() -> None:
-    @scorer(metrics=[])
-    def original_still_there():
-        async def score(state: TaskState, target: Target) -> Score:
-            text = await sandbox().read_file("out.txt")
-            return Score(value=CORRECT if text == "orig" else INCORRECT)
-
-        return score
-
+    overwrite = irv.command_succeeds("true", restore_files={"out.txt": "replay"})
     log = run(
-        ["printf orig > out.txt"],
-        [irv.replay_scorer([irv.file_exists("out.txt")]), original_still_there()],
+        ["printf orig > out.txt"], [irv.replay_scorer([overwrite]), file_is("out.txt", "orig")]
     )
-    assert value(log, "original_still_there") == CORRECT
+    assert value(log, "file_is") == CORRECT
