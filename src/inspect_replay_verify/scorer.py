@@ -36,7 +36,12 @@ from .replay import (
     replay,
     resolve_checks,
 )
-from .transcript import DEFAULT_SKIP_TOOLS, Untranscribed, recorded_calls
+from .transcript import (
+    DEFAULT_SKIP_TOOLS,
+    UNTRANSCRIBED_POLICIES,
+    Untranscribed,
+    recorded_calls,
+)
 
 
 def as_spec(sandbox: SandboxEnvironmentType | None) -> SandboxEnvironmentSpec | None:
@@ -171,6 +176,9 @@ def replay_scorer(
       inconclusive_value: Score value for an inconclusive replay (never a pass).
       max_concurrent: Cap on simultaneous replay sandboxes across the eval.
     """
+
+    if untranscribed not in UNTRANSCRIBED_POLICIES:
+        raise ValueError(f"untranscribed is one of {UNTRANSCRIBED_POLICIES}, not {untranscribed!r}")
 
     async def score(state: TaskState, target: Target) -> Score:
         events = list(transcript().events)

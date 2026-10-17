@@ -214,9 +214,13 @@ class _Replayed:
     error: str | None = None
 
 
+def _exit_status(returncode: int | None) -> str | None:
+    return f"exit {returncode}" if returncode else None
+
+
 def _recorded_status(call: RecordedCall) -> str | None:
     if call.kind == "exec":
-        return f"exit {call.returncode}" if call.returncode else None
+        return _exit_status(call.returncode)
     return call.error.type if call.error else None
 
 
@@ -253,9 +257,10 @@ async def _reissue_action(
             env=args.get("env") or {},
             user=args.get("user"),
             timeout=args.get("timeout"),
+            timeout_retry=args.get("timeout_retry", True),
         )
     return _Replayed(
-        status=f"exit {result.returncode}" if result.returncode else None,
+        status=_exit_status(result.returncode),
         output=result.stdout + result.stderr,
     )
 

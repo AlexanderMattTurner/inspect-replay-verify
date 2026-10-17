@@ -124,11 +124,17 @@ runs inside the sandbox through the agent bridge. Inspect records each such acti
 | `"replay"`                 | re-issue each `exec` and `write_file` in transcript order, beside the tool calls |
 | `"ignore"`                 | leave them out, so their effect counts against the agent                  |
 
-Even with `"replay"`, some actions are unreproducible. These are an action whose
-recorded input Inspect truncated (more than 20 lines, or binary content), an action that
-never completed, and a command during which a model call ran. That last case is an agent
+Even with `"replay"`, some actions are unreproducible. One is an action whose recorded
+input Inspect cut short: text of 10,000 characters or more, more than 20 lines, or any
+binary content. The other is a command during which a model call ran. That last case is an agent
 working inside the sandbox, so its effects are not a fixed command. Sandbox actions made
-by a tool's own body, by Inspect's sample setup, or by scorers are never counted.
+by an ordinary tool's own body, by Inspect's sample setup, or by scorers are never
+counted. An agent's own sandbox calls are counted, whether the agent runs through a
+handoff or as a tool.
+
+Inspect records an action only once it returns. An `exec` or `write_file` that raises,
+on a timeout for example, leaves no `SandboxEvent`. If a solver catches that error, the
+action's effect is invisible to the replay.
 
 ### Divergence
 
@@ -157,6 +163,9 @@ adapter may freeze the sandbox between the two phases.
 
 To stop an agent from passing by rewriting its own tests, pass `restore_files=` to a live
 check. Pristine copies are then written over the agent's files before the check runs.
+
+A `custom_check` function returns a bool or a `CheckOutcome(name=..., passed=...)`.
+`CheckOutcome`, `RecordedCall` and `PristineState` take keyword arguments only.
 
 Checks can also be built per sample from a `ReplayContext` (sample id, metadata, target):
 
@@ -265,7 +274,8 @@ mybackend = "my_package.replay:MyBackendAdapter"
 ```
 uv venv && uv pip install -e ".[dev]"
 pytest                    # real evals on Inspect's local sandbox, and unit tests
-pytest -m docker          # real evals in Docker containers (needs a Docker daemon)
+pytest -m docker          # real evals in Docker containers (needs a Docker daemon;
+                          # IRV_E2E_IMAGE picks another registry for the image)
 pytest -m glovebox        # real glovebox microVMs (needs KVM and a provisioned host)
 python tools/mutate.py    # break each decision the verdict rests on; a test must go red
 ruff check . && ruff format --check . && mypy

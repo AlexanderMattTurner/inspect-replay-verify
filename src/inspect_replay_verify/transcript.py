@@ -22,9 +22,20 @@ sandbox; ``unreproducible`` stops the replay, which is then inconclusive."""
 Kind = Literal["tool", "exec", "write_file"]
 Untranscribed = Literal["inconclusive", "replay", "ignore"]
 
+# `memory` is backed by the sample's store, not its sandbox.
 DEFAULT_SKIP_TOOLS: frozenset[str] = frozenset(
-    {"think", "submit", "web_search", "ask_user", "notify_user", "update_plan", "todo_write"}
+    {
+        "think",
+        "submit",
+        "web_search",
+        "ask_user",
+        "notify_user",
+        "update_plan",
+        "todo_write",
+        "memory",
+    }
 )
+UNTRANSCRIBED_POLICIES: tuple[str, ...] = get_args(Untranscribed)
 
 # The span this package's replays run under, so no later read mistakes one for the agent.
 REPLAY_SPAN_TYPE = "replay_verify"
@@ -48,7 +59,10 @@ ERROR_DISPOSITIONS: dict[str, tuple[Disposition, str]] = {
 
 ERROR_TYPES: tuple[str, ...] = get_args(ToolCallError.__annotations__["type"])
 
-# How `SandboxEvent` renders content it cut short (inspect_ai.util._sandbox.events).
+# How `SandboxEvent` records content (inspect_ai.util._sandbox.events.content_display):
+# text is cut to 10,000 characters with no marker, then to 20 lines with one, and
+# bytes become a size. A recorded input this long, marked, or sized is not the input.
+_RECORDED_CHARS = 100 * 100
 _TRUNCATED = "\n\nOutput truncated ("
 _BINARY = "binary ("
 
@@ -109,30 +123,41 @@ def _classify(
     return "replay", ""
 
 
+_SCORING = frozenset({"scorer", REPLAY_SPAN_TYPE})
+
+
 class _Spans:
     """Which events the agent caused: none from init, scoring, a tool body or a replay."""
 
     def __init__(self, events: Sequence[object]) -> None:
         self._spans = {e.id: e for e in events if isinstance(e, SpanBeginEvent)}
 
-    def _types(self, span_id: str | None) -> set[str]:
-        found: set[str] = set()
-        seen: set[str] = set()
-        while span_id is not None and span_id not in seen:
-            begin = self._spans.get(span_id)
-            if begin is None:
+    def _ancestry(self, span_id: str | None) -> list[SpanBeginEvent]:
+        chain: list[SpanBeginEvent] = []
+        while span_id is not None and (begin := self._spans.get(span_id)) is not None:
+            if begin in chain:
                 break
-            seen.add(span_id)
-            found.update(t for t in (begin.type, begin.name) if t)
+            chain.append(begin)
             span_id = begin.parent_id
-        return found
+        return chain
 
     def outside_scoring(self, span_id: str | None) -> bool:
-        return not self._types(span_id) & {"scorer", "scorers", REPLAY_SPAN_TYPE}
+        return not any(b.type in _SCORING or b.name == "scorers" for b in self._ancestry(span_id))
 
     def untranscribed(self, span_id: str | None) -> bool:
-        types = self._types(span_id)
-        return not types & {"scorer", "scorers", REPLAY_SPAN_TYPE, "tool", "init"}
+        """Not scoring, not sample init, and not inside a tool body the replay re-runs.
+
+        The nearest tool, agent or handoff span decides: an ordinary tool's body is
+        replayed with its call, while an agent's own sandbox calls are not.
+        """
+        chain = self._ancestry(span_id)
+        if not self.outside_scoring(span_id) or any(b.type == "init" for b in chain):
+            return False
+        nearest = next((b.type for b in chain if b.type in ("tool", "agent", "handoff")), None)
+        if nearest != "tool":
+            return True
+        index = next(i for i, b in enumerate(chain) if b.type == "tool")
+        return index + 1 < len(chain) and chain[index + 1].type == "handoff"
 
 
 def _tool_call(event: ToolEvent, skip: frozenset[str]) -> RecordedCall:
@@ -179,14 +204,12 @@ def _sandbox_action(
             f"sandbox action outside any tool call ({what}); pass untranscribed='replay' "
             "to re-issue such actions or 'ignore' to leave them out"
         )
-    elif event.pending:
-        disposition, reason = "unreproducible", f"{what} never completed"
     elif _overlaps_model(event, model_starts):
         disposition = "unreproducible"
         reason = (
             f"a model call ran during {what}: an agent in the sandbox, not a replayable command"
         )
-    elif _TRUNCATED in content or (event.action == "write_file" and content.startswith(_BINARY)):
+    elif _TRUNCATED in content or content.startswith(_BINARY) or len(content) >= _RECORDED_CHARS:
         disposition, reason = "unreproducible", f"the transcript kept only part of {what}'s input"
     options = dict(event.options or {})
     arguments: dict[str, Any] = (
@@ -214,6 +237,8 @@ def calls_from_events(
     untranscribed: Untranscribed = "inconclusive",
 ) -> list[RecordedCall]:
     """Recorded actions, in transcript order, from a sample's events."""
+    if untranscribed not in UNTRANSCRIBED_POLICIES:
+        raise ValueError(f"untranscribed is one of {UNTRANSCRIBED_POLICIES}, not {untranscribed!r}")
     events = list(events)
     spans = _Spans(events)
     skip = frozenset(skip_tools)
@@ -272,8 +297,7 @@ def recorded_calls(
     untranscribed: Untranscribed = "inconclusive",
 ) -> tuple[list[RecordedCall], Literal["events", "messages"]]:
     """The actions to replay, preferring events and falling back to messages."""
-    events = list(events or [])
-    if any(isinstance(e, ToolEvent | SandboxEvent) for e in events):
-        calls = calls_from_events(events, skip_tools=skip_tools, untranscribed=untranscribed)
+    calls = calls_from_events(events or [], skip_tools=skip_tools, untranscribed=untranscribed)
+    if calls:
         return calls, "events"
     return calls_from_messages(messages or [], skip_tools=skip_tools), "messages"
