@@ -49,8 +49,8 @@ MUTANTS = [
     ),
     Mutant(
         file="transcript.py",
-        old='        if nearest != "tool":\n            return True',
-        new="        if True:\n            return True",
+        old='return next((b.type for b in chain if b.type in ("tool", "agent")), None) != "tool"',
+        new="return True",
         breaks="a tool's own sandbox calls are counted as untranscribed",
     ),
     Mutant(
